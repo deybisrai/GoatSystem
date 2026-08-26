@@ -1,11 +1,11 @@
 <div class="row prod-items prod-items-2">
-    {% for producto in productos %}
+    {% for variante in variantes %}
     <article class="cf-sm-6 cf-md-6 cf-lg-6 col-xs-6 col-sm-6 col-md-6 col-lg-6 sectgl-item">
         <div class="sectgl prod-i">
             <div class="prod-i-top">
-                <a class="prod-i-img" href="{% url 'web:producto' producto.id %}">
-                    {% if producto.imagen %}
-                        <img src="{{producto.imagen.url}}" alt="">
+                <a class="prod-i-img" href="{% url 'web:producto' variante.sku %}">
+                    {% if variante.imagen %}
+                        <img src="{{ variante.imagen.url }}" alt="{{ variante.producto.nombre }} {{ variante.color }}">
                     {% else %}
                         <img src="https://via.placeholder.com/250" alt="">
                     {% endif %}
@@ -13,19 +13,40 @@
                 <div class="prod-i-actions">
                     <div class="prod-i-actions-in">
                         <p class="prod-i-cart">
-                            <a href="{% url 'web:agregarCarrito' producto.id %}" class="hover-label prod-addbtn"><i class="icon ion-android-cart"></i><span>Añadir al carrito</span></a>
+                            <a href="{% url 'web:producto' variante.sku %}" class="hover-label prod-addbtn"><i class="icon ion-android-cart"></i><span>Ver tallas</span></a>
                         </p>
                     </div>
                 </div>
             </div>
             <div class="prod-i-bot">
                 <div class="prod-i-info">
-                    <p class="prod-i-price">s/{{producto.precio}}</p>
-                    <p class="prod-i-categ"><a href="#">{{producto.categoria}}</a></p>
+                    <p class="prod-i-price">
+                        {% with precio_lista=variante.precio_venta precio=variante.precio_actual %}
+                            {% if precio < precio_lista %}
+                                <del style="opacity:.55;font-weight:400">s/{{ precio_lista }}</del>
+                                <ins style="text-decoration:none">s/{{ precio }}</ins>
+                            {% else %}
+                                s/{{ precio }}
+                            {% endif %}
+                        {% endwith %}
+                    </p>
+                    <p class="prod-i-categ"><a href="{% url 'web:productosPorCategoria' variante.producto.categoria.id %}">{{ variante.producto.categoria }}</a></p>
                 </div>
-                <h3 class="prod-i-ttl"><a href="{% url 'web:producto' producto.id %}">{{producto.nombre}}</a></h3>
+                <h3 class="prod-i-ttl">
+                    <a href="{% url 'web:producto' variante.sku %}">{{ variante.producto.nombre }} - {{ variante.color }}</a>
+                </h3>
             </div>
         </div>
+    </article>
+    {% empty %}
+    <article class="col-xs-12">
+        <p style="padding:30px 0;text-align:center;opacity:.7">
+            {% if busqueda %}
+                No encontramos productos para "{{ busqueda }}".
+            {% else %}
+                Aun no hay productos en esta seccion.
+            {% endif %}
+        </p>
     </article>
     {% endfor %}
 </div>

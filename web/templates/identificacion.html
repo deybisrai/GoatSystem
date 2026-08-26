@@ -1,0 +1,112 @@
+{% extends 'layout.html' %}
+{% block content %}
+<h1 class="maincont-ttl">Como quieres continuar</h1>
+<ul class="b-crumbs">
+    <li><a href="{% url 'web:index' %}">Inicio</a></li>
+    <li><a href="{% url 'web:carrito' %}">Carrito</a></li>
+    <li>Identificacion</li>
+</ul>
+
+<div class="identificacion">
+    <section class="ident-opcion">
+        <h2>Ya tengo cuenta</h2>
+        <p>Inicia sesion y completamos tus datos de envio automaticamente.</p>
+        <ul class="ident-ventajas">
+            <li>Tus datos quedan precargados</li>
+            <li>Revisa el historial de tus pedidos</li>
+        </ul>
+        <a href="{% url 'web:loginUsuario' %}?next={% url 'web:registrarPedido' %}" class="button ident-boton">
+            Iniciar sesion
+        </a>
+    </section>
+
+    <section class="ident-opcion">
+        <h2>Comprar como invitado</h2>
+        <p>Completa tus datos y listo. No necesitas crear una cuenta.</p>
+        <ul class="ident-ventajas">
+            <li>Sin registro ni contrasena</li>
+            <li>Te escribimos al correo que nos dejes</li>
+        </ul>
+        <a href="{% url 'web:continuarComoInvitado' %}" class="button ident-boton ident-boton-secundario">
+            Continuar como invitado
+        </a>
+    </section>
+</div>
+
+<p class="ident-volver">
+    <a href="{% url 'web:carrito' %}">Volver al carrito</a>
+</p>
+
+<style>
+    .identificacion {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 20px;
+        max-width: 760px;
+        margin: 28px auto 10px;
+    }
+
+    .ident-opcion {
+        display: flex;
+        flex-direction: column;
+        background: #fff;
+        border: 1px solid #e6e6e6;
+        border-radius: 4px;
+        padding: 26px 24px;
+    }
+    .ident-opcion h2 {
+        margin: 0 0 10px;
+        font-size: 19px;
+    }
+    .ident-opcion > p {
+        margin: 0 0 16px;
+        color: #6a6a6a;
+        font-size: 14px;
+        line-height: 1.5;
+    }
+
+    .ident-ventajas {
+        list-style: none;
+        margin: 0 0 22px;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        font-size: 13.5px;
+        color: #4a4a4a;
+        flex: 1 1 auto;
+    }
+    .ident-ventajas li {
+        position: relative;
+        padding-left: 22px;
+    }
+    .ident-ventajas li::before {
+        content: '\2713';
+        position: absolute;
+        left: 0;
+        color: #3e7a4c;
+        font-weight: 700;
+    }
+
+    .ident-boton {
+        display: block;
+        text-align: center;
+        padding: 13px;
+    }
+    .ident-boton-secundario {
+        background: #f4f4f4 !important;
+        color: #333 !important;
+    }
+
+    .ident-volver {
+        text-align: center;
+        margin: 6px 0 50px;
+        font-size: 13px;
+    }
+    .ident-volver a { color: #8c8c8c; }
+
+    @media (max-width: 700px) {
+        .identificacion { grid-template-columns: 1fr; }
+    }
+</style>
+{% endblock %}

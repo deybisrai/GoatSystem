@@ -1,12 +1,12 @@
-{% load static %}
+{% load static estaticos %}
 <!--footer-->
     <div class="container-fluid blog-sb-widgets page-styling site-footer">
         <div class="row">
             <div class="col-sm-12 col-md-4 widget align-center-tablet f-logo-wrap">
-                <a href="index.html" class="f-logo">
-                    <img src="{% static 'img/logo.png' %}" alt="">
+                <a href="{% url 'web:index' %}" class="f-logo">
+                    <img src="{% static_v 'img/logo.png' %}" alt="GOAT X">
                 </a>
-                <p>Proyecto Ecommerce con Django para Goat X</p>
+                <p>Tienda virtual GOAT X</p>
                 <button class="btn callback">Contacto</button>
             </div>
         </div>

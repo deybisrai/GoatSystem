@@ -1,0 +1,33 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<h1>Generar inventario desde una curva</h1>
+
+<p>Se crearan las unidades de inventario para estas variantes:</p>
+<ul>
+    {% for variante in variantes %}
+        <li><b>{{ variante.sku }}</b> — {{ variante.producto.nombre }} ({{ variante.color }})</li>
+    {% endfor %}
+</ul>
+
+<form method="post">
+    {% csrf_token %}
+    {% for id in seleccionadas %}
+        <input type="hidden" name="_selected_action" value="{{ id }}">
+    {% endfor %}
+    <input type="hidden" name="action" value="{{ accion }}">
+
+    <p>{{ formulario.curva.label_tag }} {{ formulario.curva }}</p>
+    {% for error in formulario.curva.errors %}<p style="color:#b5541b">{{ error }}</p>{% endfor %}
+
+    <p style="color:#666;font-size:13px">
+        Las unidades que ya existan no se duplican: se respetan con su stock actual.
+        Despues puedes agregar o quitar unidades sueltas desde la variante.
+    </p>
+
+    <p>
+        <input type="submit" name="aplicar" value="Generar" class="default">
+        <a href="../" class="button" style="margin-left:8px">Cancelar</a>
+    </p>
+</form>
+{% endblock %}

@@ -1,101 +1,192 @@
-from django.shortcuts import render,get_object_or_404,redirect
+from django.contrib import messages
+from django.contrib.auth import authenticate, login, logout
+from django.contrib.auth.decorators import login_required
+from django.contrib.auth.models import User
+from django.http import JsonResponse
+from django.shortcuts import get_object_or_404, redirect, render
 
-from .models import Categoria,Producto,Cliente
-
-# Create your views here.
+from .carrito import Cart
+from .forms import ClienteForm, PedidoForm
+from .models import Categoria, Cliente, Pedido, Variante, Inventario
+from .pedidos import PedidoError, crear_pedido
 
 """ VISTAS PARA EL CATALOGO DE PRODUCTOS """
 
+
+def _variantes_visibles():
+    """ Solo colores activos de productos activos, con producto y categoria ya cargados """
+    return (
+        Variante.objects
+        .filter(activo=True, producto__activo=True)
+        .select_related('producto', 'producto__categoria')
+    )
+
+
+def _contexto_catalogo(variantes, **extra):
+    context = {
+        'variantes': variantes,
+        'categorias': Categoria.objects.filter(activo=True),
+    }
+    context.update(extra)
+    return context
+
+
 def index(request):
-    listaProductos = Producto.objects.all()
-    listaCategorias = Categoria.objects.all() 
-    context = {
-        'productos':listaProductos,
-        'categorias':listaCategorias,
-    }
-    return render(request,'index.html',context)
+    return render(request, 'index.html', _contexto_catalogo(_variantes_visibles()))
 
-def productosPorCategoria(request,categoria_id):
+
+def productosPorCategoria(request, categoria_id):
     """ vista para filtrar productos por categoria """
-    objCategoria = Categoria.objects.get(pk=categoria_id)
-    listaProductos = objCategoria.producto_set.all()
+    categoria = get_object_or_404(Categoria, pk=categoria_id)
+    variantes = _variantes_visibles().filter(producto__categoria=categoria)
+    return render(request, 'index.html', _contexto_catalogo(variantes, categoria_actual=categoria))
 
-    listaCategorias = Categoria.objects.all()
-
-    context = {
-        'categorias':listaCategorias,
-        'productos':listaProductos,
-    }
-
-    return render(request,'index.html',context)
 
 def productosPorNombre(request):
     """ vista para filtrado de productos por nombre """
-    nombre= request.POST['nombre']
+    nombre = request.POST.get('nombre', '').strip()
+    variantes = _variantes_visibles()
+    if nombre:
+        variantes = variantes.filter(producto__nombre__icontains=nombre)
+    return render(request, 'index.html', _contexto_catalogo(variantes, busqueda=nombre))
 
-    listaProductos = Producto.objects.filter(nombre__contains=nombre)
-    listaCategorias = Categoria.objects.all()
+
+def productoDetalle(request, sku):
+    """ Detalle de un color: sus unidades vendibles y los otros colores del mismo producto """
+    variante = get_object_or_404(_variantes_visibles(), sku=sku)
+    items = variante.items.select_related('valor__atributo').order_by('valor__orden', 'valor__valor')
+    otros_colores = _variantes_visibles().filter(producto=variante.producto).exclude(pk=variante.pk)
+
+    atributo = variante.producto.categoria.atributo
 
     context = {
-        'categorias':listaCategorias,
-        'productos':listaProductos,
+        'variante': variante,
+        'producto': variante.producto,
+        'items': items,
+        'atributo': atributo,
+        'usa_atributo': atributo is not None,
+        'otros_colores': otros_colores,
+        'hay_stock': any(i.disponible for i in items),
     }
+    return render(request, 'producto.html', context)
 
-    return render(request,'index.html',context)
-
-def productoDetalle(request,producto_id):
-    """ vista para el detalle de producto """
-
-    #objProducto = Producto.objects.get(pk=producto_id)
-    objProducto = get_object_or_404(Producto,pk=producto_id)
-    context= {
-        'producto':objProducto
-    }
-
-    return render(request,'producto.html',context)
 
 """" VISTAS PARA EL CARRITO DE COMPRAS """
 
-from .carrito import Cart
 
 def carrito(request):
-    return render(request,'carrito.html')
+    return render(request, 'carrito.html', {'carrito': Cart(request)})
 
-def agregarCarrito(request,producto_id):
-    if request.method == 'POST':
-        cantidad = int(request.POST['cantidad'])
-    else:
+
+def _es_ajax(request):
+    return request.headers.get('X-Requested-With') == 'XMLHttpRequest'
+
+
+def agregarCarrito(request):
+    """
+    La unidad elegida (talla, capacidad...) llega en el POST, porque el cliente
+    la selecciona en el formulario. Si la peticion viene por AJAX responde JSON y
+    el cliente se queda en la pagina; si no, redirige al producto (sin JavaScript).
+    """
+    if request.method != 'POST':
+        return redirect('web:carrito')
+
+    sku = request.POST.get('sku')
+    item_id = request.POST.get('item_id')
+
+    def error(mensaje):
+        if _es_ajax(request):
+            return JsonResponse({'ok': False, 'mensaje': mensaje}, status=400)
+        messages.error(request, mensaje)
+        return redirect('web:producto', sku=sku) if sku else redirect('web:index')
+
+    if not item_id:
+        return error('Elige una opcion antes de agregar al carrito')
+
+    item = get_object_or_404(
+        Inventario.objects.select_related('variante__producto__categoria', 'valor__atributo'),
+        pk=item_id,
+    )
+
+    try:
+        cantidad = int(request.POST.get('cantidad', 1))
+    except (TypeError, ValueError):
         cantidad = 1
 
-    objProducto = Producto.objects.get(pk=producto_id)
-    carritoProducto = Cart(request)
-    carritoProducto.add(objProducto,cantidad)
+    carrito_actual = Cart(request)
+    try:
+        carrito_actual.add(item, cantidad)
+    except ValueError as problema:
+        return error(str(problema))
 
-    if request.method == 'GET':
-        return redirect('/')
+    variante = item.variante
+    detalle = f' {item.valor.atributo.nombre.lower()} {item.valor}' if item.valor_id else ''
+    mensaje = f'{variante.producto.nombre} ({variante.color}){detalle} agregado al carrito'
 
-    return render(request,'carrito.html')
+    if _es_ajax(request):
+        return JsonResponse({
+            'ok': True,
+            'mensaje': mensaje,
+            'items': carrito_actual.cantidad_items,
+            'lineas': len(carrito_actual),
+            'total': str(carrito_actual.total),
+        })
 
-def eliminarProductoCarrito(request,producto_id):
-    objProducto = Producto.objects.get(pk=producto_id)
-    carritoProducto = Cart(request)
-    carritoProducto.delete(objProducto)
+    messages.success(request, mensaje)
+    return redirect('web:producto', sku=variante.sku)
 
-    return render(request,'carrito.html')
+
+def actualizarCarrito(request, item_id):
+    if request.method != 'POST':
+        return redirect('web:carrito')
+
+    item = get_object_or_404(Inventario.objects.select_related('valor__atributo'), pk=item_id)
+    try:
+        cantidad = int(request.POST.get('cantidad', 1))
+    except (TypeError, ValueError):
+        cantidad = 1
+
+    try:
+        Cart(request).actualizar(item, cantidad)
+    except ValueError as error:
+        messages.error(request, str(error))
+
+    return redirect('web:carrito')
+
+
+def eliminarProductoCarrito(request, item_id):
+    item = get_object_or_404(Inventario, pk=item_id)
+    Cart(request).delete(item)
+    return redirect('web:carrito')
+
 
 def limpiarCarrito(request):
-    carritoProducto = Cart(request)
-    carritoProducto.clear()
+    Cart(request).clear()
+    return redirect('web:carrito')
 
-    return render(request,'carrito.html')
+
+def aplicarCupon(request):
+    if request.method != 'POST':
+        return redirect('web:carrito')
+
+    try:
+        cupon = Cart(request).aplicar_cupon(request.POST.get('codigo'))
+    except ValueError as problema:
+        messages.error(request, str(problema))
+    else:
+        messages.success(request, f'Cupon {cupon.codigo} aplicado')
+
+    return redirect('web:carrito')
+
+
+def quitarCupon(request):
+    Cart(request).quitar_cupon()
+    messages.success(request, 'Cupon retirado')
+    return redirect('web:carrito')
+
 
 """ VISTAS PARA CLIENTES Y USUARIOS """
 
-from django.contrib.auth.models import User
-from django.contrib.auth import login,logout,authenticate
-from django.contrib.auth.decorators import login_required
-
-from .forms import ClienteForm
 
 def crearUsuario(request):
 
@@ -103,17 +194,21 @@ def crearUsuario(request):
         dataUsuario = request.POST['nuevoUsuario']
         dataPassword = request.POST['nuevoPassword']
 
-        nuevoUsuario = User.objects.create_user(username=dataUsuario,password=dataPassword)
+        if User.objects.filter(username=dataUsuario).exists():
+            return render(request, 'login.html', {'mensajeError': 'Ese usuario ya esta registrado'})
+
+        nuevoUsuario = User.objects.create_user(username=dataUsuario, password=dataPassword)
         if nuevoUsuario is not None:
-            login(request,nuevoUsuario)
+            login(request, nuevoUsuario)
             return redirect('/cuenta')
 
-    return render(request,'login.html')
+    return render(request, 'login.html')
+
 
 def loginUsuario(request):
-    paginaDestino = request.GET.get('next',None)
+    paginaDestino = request.GET.get('next', None)
     context = {
-        'destino':paginaDestino
+        'destino': paginaDestino
     }
 
     if request.method == 'POST':
@@ -121,9 +216,9 @@ def loginUsuario(request):
         dataPassword = request.POST['password']
         dataDestino = request.POST['destino']
 
-        usuarioAuth = authenticate(request,username=dataUsuario,password=dataPassword)
+        usuarioAuth = authenticate(request, username=dataUsuario, password=dataPassword)
         if usuarioAuth is not None:
-            login(request,usuarioAuth)
+            login(request, usuarioAuth)
 
             if dataDestino != 'None':
                 return redirect(dataDestino)
@@ -131,47 +226,45 @@ def loginUsuario(request):
             return redirect('/cuenta')
         else:
             context = {
-                'mensajeError':'Datos Incorrectos'
+                'mensajeError': 'Datos Incorrectos'
             }
 
-    return render(request,'login.html',context)
+    return render(request, 'login.html', context)
+
 
 def logoutUsuario(request):
     logout(request)
-    return render(request,'login.html')
+    return redirect('web:index')
 
 
-def cuentaUsuario(request):
-
-    try:
-        clienteEditar = Cliente.objects.get(usuario = request.user)
-
-        dataCliente = {
-            'nombre':request.user.first_name,
-            'apellidos':request.user.last_name,
-            'email':request.user.email,
-            'direccion':clienteEditar.direccion,
-            'telefono':clienteEditar.telefono,
-            'dni':clienteEditar.dni,
-            'sexo':clienteEditar.sexo,
-            'fecha_nacimiento':clienteEditar.fecha_nacimiento,
-        }
-    except:
-        dataCliente = {
-                    'nombre':request.user.first_name,
-                    'apellidos':request.user.last_name,
-                    'email':request.user.email,
-        }
-
-    frmCliente = ClienteForm(dataCliente)
-    context = {
-        'frmCliente':frmCliente
+def _datos_cliente(usuario):
+    """ Arma el diccionario inicial del formulario con lo que ya tenga el cliente """
+    datos = {
+        'nombre': usuario.first_name,
+        'apellidos': usuario.last_name,
+        'email': usuario.email,
     }
+    cliente = Cliente.objects.filter(usuario=usuario).first()
+    if cliente:
+        datos.update({
+            'direccion': cliente.direccion,
+            'telefono': cliente.telefono,
+            'dni': cliente.dni,
+            'sexo': cliente.sexo,
+            'fecha_nacimiento': cliente.fecha_nacimiento,
+        })
+    return datos
 
-    return render(request,'cuenta.html',context)
 
+@login_required(login_url='/login')
+def cuentaUsuario(request):
+    return render(request, 'cuenta.html', {'frmCliente': ClienteForm(_datos_cliente(request.user))})
+
+
+@login_required(login_url='/login')
 def actualizarCliente(request):
     mensaje = ''
+    frmCliente = ClienteForm(_datos_cliente(request.user))
 
     if request.method == 'POST':
         frmCliente = ClienteForm(request.POST)
@@ -179,58 +272,118 @@ def actualizarCliente(request):
             dataCliente = frmCliente.cleaned_data
 
             # actualizar usuario
-            actUsuario = User.objects.get(pk=request.user.id)
+            actUsuario = request.user
             actUsuario.first_name = dataCliente['nombre']
             actUsuario.last_name = dataCliente['apellidos']
             actUsuario.email = dataCliente['email']
             actUsuario.save()
 
-            # registrar al cliente
-            nuevoCliente = Cliente()
-            nuevoCliente.usuario = actUsuario
-            nuevoCliente.dni = dataCliente['dni']
-            nuevoCliente.direccion = dataCliente['direccion']
-            nuevoCliente.telefono = dataCliente['telefono']
-            nuevoCliente.sexo = dataCliente['sexo']
-            nuevoCliente.fecha_nacimiento = dataCliente['fecha_nacimiento']
-            nuevoCliente.save()
+            # crear o actualizar al cliente (nunca duplicarlo)
+            Cliente.objects.update_or_create(
+                usuario=actUsuario,
+                defaults={
+                    'dni': dataCliente['dni'],
+                    'direccion': dataCliente['direccion'],
+                    'telefono': dataCliente['telefono'],
+                    'sexo': dataCliente['sexo'],
+                    'fecha_nacimiento': dataCliente['fecha_nacimiento'],
+                },
+            )
 
             mensaje = 'Datos Actualizados'
 
     context = {
-        'mensaje':mensaje,
-        'frmCliente':frmCliente
+        'mensaje': mensaje,
+        'frmCliente': frmCliente,
     }
 
-    return render(request,'cuenta.html',context)
+    return render(request, 'cuenta.html', context)
+
 
 """" VISTAS PARA PROCESO DE COMPRA """
-@login_required(login_url='/login')
+
+
+def _datos_pedido(usuario):
+    """ Precarga el checkout con los datos del cliente si ya inicio sesion """
+    if not usuario.is_authenticated:
+        return {}
+
+    datos = {
+        'nombre': usuario.first_name,
+        'apellidos': usuario.last_name,
+        'email': usuario.email,
+    }
+    cliente = Cliente.objects.filter(usuario=usuario).first()
+    if cliente:
+        datos.update({
+            'telefono': cliente.telefono,
+            'dni': cliente.dni,
+            'direccion': cliente.direccion,
+        })
+    return datos
+
+
+CLAVE_INVITADO = 'compra_como_invitado'
+
+
+def identificarse(request):
+    """ Antes del checkout: elegir entre iniciar sesion o comprar como invitado """
+    if len(Cart(request)) == 0:
+        messages.error(request, 'Tu carrito esta vacio')
+        return redirect('web:carrito')
+
+    if request.user.is_authenticated:
+        return redirect('web:registrarPedido')
+
+    return render(request, 'identificacion.html')
+
+
+def continuarComoInvitado(request):
+    request.session[CLAVE_INVITADO] = True
+    return redirect('web:registrarPedido')
+
 
 def registrarPedido(request):
-    try:
-        clienteEditar = Cliente.objects.get(usuario = request.user)
-    
-        dataCliente = {
-            'nombre':request.user.first_name,
-            'apellidos':request.user.last_name,
-            'email':request.user.email,
-            'direccion':clienteEditar.direccion,
-            'telefono':clienteEditar.telefono,
-            'dni':clienteEditar.dni,
-            'sexo':clienteEditar.sexo,
-            'fecha_nacimiento':clienteEditar.fecha_nacimiento,
-        }
-    except:
-        dataCliente = {
-            'nombre':request.user.first_name,
-            'apellidos':request.user.last_name,
-            'email':request.user.email,
-        }
-    
-    frmCliente = ClienteForm(dataCliente)
-    context = {
-        'frmCliente':frmCliente
-    }
+    """ Checkout. No exige cuenta: tambien se puede comprar como invitado. """
+    carrito_actual = Cart(request)
+    if len(carrito_actual) == 0:
+        messages.error(request, 'Tu carrito esta vacio')
+        return redirect('web:carrito')
 
-    return render(request,'pedido.html',context)
+    # sin sesion iniciada y sin haber elegido "invitado", primero se identifica
+    if not request.user.is_authenticated and not request.session.get(CLAVE_INVITADO):
+        return redirect('web:identificarse')
+
+    if request.method == 'POST':
+        frmPedido = PedidoForm(request.POST)
+        if frmPedido.is_valid():
+            try:
+                pedido = crear_pedido(carrito_actual, frmPedido.cleaned_data, request.user)
+            except PedidoError as problema:
+                messages.error(request, str(problema))
+                return redirect('web:carrito')
+
+            carrito_actual.clear()
+            request.session.pop(CLAVE_INVITADO, None)
+            request.session['ultimo_pedido'] = pedido.id
+            return redirect('web:gracias')
+
+        messages.error(request, 'Revisa los datos marcados en el formulario')
+    else:
+        frmPedido = PedidoForm(initial=_datos_pedido(request.user))
+
+    context = {
+        'frmPedido': frmPedido,
+        'carrito': carrito_actual,
+    }
+    return render(request, 'pedido.html', context)
+
+
+def gracias(request):
+    """ Confirmacion. Lee el pedido de la sesion, no de la URL, para no exponerlo. """
+    pedido_id = request.session.get('ultimo_pedido')
+    if not pedido_id:
+        return redirect('web:index')
+
+    pedido = get_object_or_404(Pedido.objects.prefetch_related('detalles'), pk=pedido_id)
+    return render(request, 'gracias.html', {'pedido': pedido})

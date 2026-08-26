@@ -2,84 +2,375 @@
 {% block content %}
     <h1 class="maincont-ttl">Carrito</h1>
     <ul class="b-crumbs">
-        <li><a href="/">Home</a></li>
+        <li><a href="{% url 'web:index' %}">Inicio</a></li>
         <li>Carrito</li>
     </ul>
-    <div class="page-styling">
-    <div class="woocommerce prod-litems section-list">
-        {% for key,value in request.session.cart.items %}
-            <article class="prod-li sectls">
-                <div class="prod-li-inner">
-                    <a href="product.html" class="prod-li-img">
-                        <img src="{{value.imagen}}" alt="">
-                    </a>
-                    <div class="prod-li-cont">
-                        <div class="prod-li-ttl-wrap">
-                            <p>
-                                <a href="#">{{value.categoria}}</a>
-                            </p>
-                            <h3><a href="product.html">{{value.nombre}}</a></h3>
-                        </div><!--
-                    No Space
-                    -->
-                        <div class="prod-li-prices">
-                            <div class="prod-li-price-wrap">
-                                <p>Precio</p>
-                                <p class="prod-li-price">s/{{value.precio}}</p>
-                            </div>
-                            <div class="prod-li-qnt-wrap">
-                                <p class="qnt-wrap prod-li-qnt">
-                                    <a href="#" class="qnt-plus prod-li-plus"><i class="icon ion-arrow-up-b"></i></a>
-                                    <input type="text" value="{{value.cantidad}}">
-                                    <a href="#" class="qnt-minus prod-li-minus"><i class="icon ion-arrow-down-b"></i></a>
-                                </p>
-                            </div>
-                            <div class="prod-li-total-wrap">
-                                <p>Total</p>
-                                <p class="prod-li-total">s/{{value.subtotal}}</p>
-                            </div>
-                        </div><!--
-                No Space
-                -->
+
+    <div class="carrito-lista">
+        {% for linea in carrito %}
+            <article class="carrito-item">
+                <a href="{% url 'web:producto' linea.sku %}" class="ci-img">
+                    {% if linea.imagen %}
+                        <img src="{{ linea.imagen }}" alt="{{ linea.nombre }}">
+                    {% else %}
+                        <img src="https://via.placeholder.com/150" alt="">
+                    {% endif %}
+                </a>
+
+                <div class="ci-info">
+                    <p class="ci-categoria">{{ linea.categoria }}</p>
+                    <h3 class="ci-nombre"><a href="{% url 'web:producto' linea.sku %}">{{ linea.nombre }}</a></h3>
+                    <p class="ci-meta">{{ linea.color }}{% if linea.valor %} &middot; {{ linea.atributo }} {{ linea.valor }}{% endif %} &middot; {{ linea.sku }}</p>
+                </div>
+
+                <div class="ci-campos">
+                    <div class="ci-campo">
+                        <p class="ci-label">Precio</p>
+                        <p class="ci-valor">s/{{ linea.precio }}</p>
                     </div>
-                    <div class="prod-li-info">
-                        <div class="prod-li-rating-wrap">
-                            <p data-rating="5" class="prod-li-rating">
-                                <i class="rating-ico" title="1"></i><i class="rating-ico" title="2"></i><i class="rating-ico"
-                                    title="3"></i><i class="rating-ico" title="4"></i><i class="rating-ico" title="5"></i>
-                            </p>
-                            <p class="prod-li-rating-count">12</p>
-                        </div>
-                        <p class="prod-li-add">
-                            <a href="{% url 'web:eliminarProductoCarrito' value.producto_id %}" class="button hover-label prod-addbtn"><i
-                                    class="icon ion-close-round"></i><span>Eliminar</span></a>
-                        </p>
-                        <p class="prod-li-information">
-                            <a href="#" class="hover-label"><i class="icon ion-more"></i><span>Show Information</span></a>
-                        </p>
+
+                    <div class="ci-campo">
+                        <p class="ci-label">Cantidad</p>
+                        <form action="{% url 'web:actualizarCarrito' linea.item_id %}" method="post" class="form-cantidad">
+                            {% csrf_token %}
+                            <div class="contador">
+                                <button type="button" class="contador-btn" data-paso="-1" aria-label="Quitar uno">&minus;</button>
+                                <input type="number" name="cantidad" value="{{ linea.cantidad }}" min="1" readonly>
+                                <button type="button" class="contador-btn" data-paso="1" aria-label="Agregar uno">&plus;</button>
+                            </div>
+                        </form>
+                    </div>
+
+                    <div class="ci-campo">
+                        <p class="ci-label">Total</p>
+                        <p class="ci-valor ci-total">s/{{ linea.subtotal }}</p>
                     </div>
                 </div>
+
+                <a href="{% url 'web:eliminarProductoCarrito' linea.item_id %}"
+                   class="ci-eliminar" title="Eliminar del carrito" aria-label="Eliminar del carrito">&times;</a>
             </article>
+        {% empty %}
+            <p class="carrito-vacio">
+                Tu carrito esta vacio. <a href="{% url 'web:index' %}">Ver catalogo</a>
+            </p>
         {% endfor %}
     </div>
 
-
-    <div class="cart-actions">
-        <div class="coupon">
-            <input type="text" placeholder="Coupon code">
-            <input type="submit" class="button" value="Apply">
+    {% if carrito|length %}
+    <div class="carrito-pie">
+        <div class="carrito-cupon">
+            <p class="ci-label">Cupon de descuento</p>
+            {% if carrito.cupon %}
+                <div class="cupon-activo">
+                    <span class="cupon-codigo">{{ carrito.cupon.codigo }}</span>
+                    <span class="cupon-detalle">
+                        {% if carrito.cupon.tipo == 'P' %}
+                            &minus;{{ carrito.cupon.valor|floatformat:0 }}%
+                        {% else %}
+                            &minus;s/{{ carrito.cupon.valor }}
+                        {% endif %}
+                    </span>
+                    <a href="{% url 'web:quitarCupon' %}" class="cupon-quitar" title="Quitar cupon">&times;</a>
+                </div>
+            {% else %}
+                {% if carrito.motivo_cupon_invalido %}
+                    <p class="cupon-aviso">{{ carrito.motivo_cupon_invalido }}</p>
+                {% endif %}
+                <form action="{% url 'web:aplicarCupon' %}" method="post" class="form-cupon">
+                    {% csrf_token %}
+                    <input type="text" name="codigo" placeholder="Ej. BIENVENIDA10" autocomplete="off">
+                    <button type="submit" class="button boton-secundario">Aplicar</button>
+                </form>
+            {% endif %}
         </div>
-        <div class="cart-collaterals">
-            <a href="{% url 'web:limpiarCarrito' %}" class="checkout-button button">Limpiar Carrito</a>
-            <a href="{% url 'web:registrarPedido' %}" class="checkout-button button">Realizar Pedido</a>
-            <div class="order-total">
-                <p class="cart-totals-ttl">Total</p>
-                <p class="cart-totals-val">s/{{request.session.cartMontoTotal}}</p>
+
+        <div class="carrito-resumen">
+            <div class="linea-total">
+                <span>Subtotal</span>
+                <span>s/{{ carrito.subtotal }}</span>
+            </div>
+            {% if carrito.descuento %}
+            <div class="linea-total linea-descuento">
+                <span>Descuento ({{ carrito.cupon.codigo }})</span>
+                <span>&minus;s/{{ carrito.descuento }}</span>
+            </div>
+            {% endif %}
+            <div class="linea-total linea-final">
+                <span>Total a pagar</span>
+                <b>s/{{ carrito.total }}</b>
+            </div>
+            <div class="carrito-acciones">
+                <a href="{% url 'web:limpiarCarrito' %}" class="button boton-secundario">Limpiar Carrito</a>
+                <a href="{% url 'web:identificarse' %}" class="button">Realizar Pedido</a>
             </div>
         </div>
     </div>
+    {% endif %}
 
+    <style>
+        .carrito-lista {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            margin: 24px 0;
+        }
 
-</div>
+        .carrito-item {
+            display: grid;
+            grid-template-columns: 110px minmax(150px, 1fr) auto 40px;
+            align-items: center;
+            gap: 18px;
+            padding: 16px 18px;
+            background: #fff;
+            border: 1px solid #e6e6e6;
+            border-radius: 4px;
+        }
 
+        .ci-campos {
+            display: flex;
+            align-items: center;
+            gap: 30px;
+        }
+        .ci-campos .ci-campo { min-width: 96px; }
+
+        .ci-img {
+            display: block;
+            width: 110px;
+            height: 110px;
+        }
+        .ci-img img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+
+        .ci-info { min-width: 0; }
+        .ci-categoria {
+            margin: 0 0 4px;
+            font-size: 11px;
+            letter-spacing: .06em;
+            text-transform: uppercase;
+            color: #8c8c8c;
+        }
+        .ci-nombre {
+            margin: 0 0 4px;
+            font-size: 17px;
+            line-height: 1.25;
+        }
+        .ci-nombre a { text-decoration: none; }
+        .ci-meta {
+            margin: 0;
+            font-size: 13px;
+            color: #8c8c8c;
+        }
+
+        .ci-campo { text-align: center; }
+        .ci-label {
+            margin: 0 0 8px;
+            font-size: 11px;
+            letter-spacing: .06em;
+            text-transform: uppercase;
+            color: #8c8c8c;
+        }
+        .ci-valor {
+            margin: 0;
+            font-size: 16px;
+            font-weight: 600;
+            font-variant-numeric: tabular-nums;
+        }
+        .ci-total { font-size: 18px; }
+
+        .ci-eliminar {
+            justify-self: center;
+            width: 32px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 50%;
+            font-size: 22px;
+            line-height: 1;
+            color: #999;
+            text-decoration: none;
+            transition: background .15s, color .15s;
+        }
+        .ci-eliminar:hover {
+            background: #f6e7e0;
+            color: #b5541b;
+        }
+
+        .form-cantidad { display: flex; justify-content: center; }
+        .contador {
+            display: inline-flex;
+            align-items: center;
+            border: 1px solid #ccc;
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        .contador-btn {
+            width: 32px;
+            height: 34px;
+            border: 0;
+            background: #f4f4f4;
+            font-size: 16px;
+            line-height: 1;
+            cursor: pointer;
+            color: #333;
+        }
+        .contador-btn:hover { background: #e6e6e6; }
+        .contador-btn:disabled { opacity: .35; cursor: not-allowed; }
+        .contador input[type="number"] {
+            width: 44px;
+            height: 34px;
+            border: 0;
+            border-left: 1px solid #ddd;
+            border-right: 1px solid #ddd;
+            text-align: center;
+            font-weight: 600;
+            background: #fff;
+            -moz-appearance: textfield;
+        }
+        .contador input::-webkit-outer-spin-button,
+        .contador input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+
+        .carrito-vacio {
+            padding: 50px 0;
+            text-align: center;
+            color: #8c8c8c;
+        }
+
+        .carrito-pie {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 340px;
+            gap: 28px;
+            align-items: start;
+            padding: 22px 20px;
+            background: #fff;
+            border: 1px solid #e6e6e6;
+            border-radius: 4px;
+            margin-bottom: 40px;
+        }
+
+        .form-cupon { display: flex; gap: 8px; }
+        .form-cupon input[type="text"] {
+            flex: 1 1 auto;
+            min-width: 0;
+            height: 42px;
+            padding: 0 12px;
+            border: 1px solid #d5d5d5;
+            border-radius: 3px;
+            text-transform: uppercase;
+        }
+        .form-cupon input:focus { outline: none; border-color: #222; }
+        .form-cupon .button { padding: 0 20px; height: 42px; line-height: 42px; }
+
+        .cupon-activo {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            padding: 9px 12px;
+            background: #e6f2e9;
+            border: 1px dashed #7aa888;
+            border-radius: 3px;
+        }
+        .cupon-codigo { font-weight: 700; letter-spacing: .04em; color: #245132; }
+        .cupon-detalle { font-size: 13px; color: #3e7a4c; }
+        .cupon-quitar {
+            font-size: 18px;
+            line-height: 1;
+            color: #5a7c66;
+            text-decoration: none;
+            padding: 0 2px;
+        }
+        .cupon-quitar:hover { color: #b5541b; }
+        .cupon-aviso {
+            margin: 0 0 8px;
+            font-size: 13px;
+            color: #7d3a13;
+        }
+
+        .carrito-resumen {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .linea-total {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            font-size: 14px;
+            font-variant-numeric: tabular-nums;
+        }
+        .linea-descuento { color: #3e7a4c; }
+        .linea-final {
+            padding-top: 12px;
+            margin-top: 4px;
+            border-top: 1px solid #ececec;
+            font-size: 15px;
+        }
+        .linea-final b { font-size: 26px; font-weight: 700; }
+
+        .carrito-acciones {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 12px;
+        }
+        .carrito-acciones .button { flex: 1 1 auto; text-align: center; }
+        .boton-secundario {
+            background: #f4f4f4 !important;
+            color: #555 !important;
+        }
+
+        @media (max-width: 900px) {
+            .carrito-pie { grid-template-columns: 1fr; gap: 22px; }
+        }
+
+        @media (max-width: 900px) {
+            .carrito-item {
+                grid-template-columns: 90px 1fr 32px;
+                grid-template-areas:
+                    "img    info   del"
+                    "campos campos campos";
+                gap: 14px 12px;
+                align-items: start;
+            }
+            .ci-img      { grid-area: img; width: 90px; height: 90px; }
+            .ci-info     { grid-area: info; }
+            .ci-eliminar { grid-area: del; }
+            .ci-campos {
+                grid-area: campos;
+                justify-content: space-between;
+                gap: 12px;
+                padding-top: 12px;
+                border-top: 1px solid #f0f0f0;
+            }
+            .ci-campos .ci-campo { min-width: 0; }
+            .form-cantidad { justify-content: flex-start; }
+        }
+    </style>
+
+    <script>
+    (function () {
+        document.querySelectorAll('.form-cantidad').forEach(function (form) {
+            var input = form.querySelector('input[name="cantidad"]');
+            var menos = form.querySelector('.contador-btn[data-paso="-1"]');
+
+            if (menos && (parseInt(input.value, 10) || 1) <= 1) {
+                menos.disabled = true;
+            }
+
+            form.querySelectorAll('.contador-btn').forEach(function (btn) {
+                btn.addEventListener('click', function () {
+                    var valor = parseInt(input.value, 10) || 1;
+                    var nuevo = valor + parseInt(btn.dataset.paso, 10);
+                    if (nuevo < 1) return;
+                    input.value = nuevo;
+                    form.submit();
+                });
+            });
+        });
+    })();
+    </script>
 {% endblock %}

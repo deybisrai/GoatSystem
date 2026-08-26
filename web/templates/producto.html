@@ -1,9 +1,9 @@
 {% extends 'layout.html' %}
 {% block content %}
     <ul class="b-crumbs">
-        <li><a href="/">Home</a></li>
-        <li><a href="/">Catalog</a></li>
-        <li>Producto</li>
+        <li><a href="{% url 'web:index' %}">Inicio</a></li>
+        <li><a href="{% url 'web:productosPorCategoria' producto.categoria.id %}">{{ producto.categoria }}</a></li>
+        <li>{{ producto.nombre }}</li>
     </ul>
     <article>
     <div class="prod">
@@ -12,102 +12,303 @@
                 <ul class="slides">
                     <li>
                         <a data-fancybox-group="prod" class="fancy-img" href="#">
-                            {% if producto.imagen %}
-                                <img src="{{producto.imagen.url}}" alt="">
+                            {% if variante.imagen %}
+                                <img src="{{ variante.imagen.url }}" alt="{{ producto.nombre }} {{ variante.color }}">
                             {% else %}
-                                <img src="https://via.placeholder.com/250" alt="">
-                            {% endif %}
-                            
-                        </a>
-                    </li>
-                    <li>
-                        <a data-fancybox-group="prod" class="fancy-img" href="#">
-                            {% if producto.imagen %}
-                                <img src="{{producto.imagen.url}}" alt="">
-                            {% else %}
-                                <img src="https://via.placeholder.com/250" alt="">
+                                <img src="https://via.placeholder.com/500" alt="">
                             {% endif %}
                         </a>
-                    </li>
-                </ul>
-                <div class="prod-slider-count"><p>
-                    <span class="count-cur">1</span> / <span class="count-all">2</span></p><p class="hover-label prod-slider-zoom">
-                    <i class="icon ion-search"></i><span>Zoom In</span></p></div>
-            </div>
-            <div class="flexslider prod-thumbs" id="prod-thumbs">
-                <ul class="slides">
-                    <li>
-                        {% if producto.imagen %}
-                                <img src="{{producto.imagen.url}}" alt="">
-                            {% else %}
-                                <img src="https://via.placeholder.com/250" alt="">
-                            {% endif %}
-                    </li>
-                    <li>
-                        {% if producto.imagen %}
-                                <img src="{{producto.imagen.url}}" alt="">
-                            {% else %}
-                                <img src="https://via.placeholder.com/250" alt="">
-                            {% endif %}
                     </li>
                 </ul>
             </div>
         </div>
 
         <div class="prod-cont">
-            <div class="prod-rating-wrap">
-                <p data-rating="4" class="prod-rating">
-                    <i class="rating-ico" title="1"></i>
-                    <i class="rating-ico" title="2"></i>
-                    <i class="rating-ico" title="3"></i>
-                    <i class="rating-ico" title="4"></i>
-                    <i class="rating-ico" title="5"></i>
-                </p>
-                <p class="prod-rating-count">7</p>
-            </div>
-            <p class="prod-categs"><a href="#">{{producto.categoria}}</a></p>
-            <h1>{{producto.nombre}}</h1>
+            <p class="prod-categs">
+                <a href="{% url 'web:productosPorCategoria' producto.categoria.id %}">{{ producto.categoria }}</a>
+            </p>
+            <h1>{{ producto.nombre }}</h1>
+            <p class="prod-sku" style="opacity:.6;margin-top:-8px">
+                {% if producto.marca %}{{ producto.marca }} &middot; {% endif %}Codigo: {{ variante.sku }} &middot; {{ variante.color }}
+            </p>
+
             <div class="variations_form cart">
-                <p class="prod-price">s/{{producto.precio}}</p>
-                <p class="prod-excerpt">{{producto.descripcion}}... 
-                    <a id="prod-showdesc" class="prod-excerpt-more" href="#">read more</a></p>
+                <p class="prod-price">
+                    {% with precio_lista=variante.precio_venta precio=variante.precio_actual %}
+                        {% if precio < precio_lista %}
+                            <del style="opacity:.55;font-weight:400;font-size:.7em">s/{{ precio_lista }}</del>
+                            <ins style="text-decoration:none">s/{{ precio }}</ins>
+                        {% else %}
+                            s/{{ precio }}
+                        {% endif %}
+                    {% endwith %}
+                </p>
+
+                {% if producto.descripcion %}
+                    <p class="prod-excerpt">{{ producto.descripcion }}</p>
+                {% endif %}
+
+                <div class="variations">
+                    <div class="variations-row">
+                        <div class="label"><label>Color: <b id="color-actual">{{ variante.color }}</b></label></div>
+                        <div class="value">
+                            <ul class="selector-colores">
+                                <li>
+                                    <span class="circulo-color activo"
+                                          style="background:{{ variante.color.muestra }}"
+                                          title="{{ variante.color }}"></span>
+                                </li>
+                                {% for otro in otros_colores %}
+                                    <li>
+                                        <a href="{% url 'web:producto' otro.sku %}" title="{{ otro.color }}">
+                                            <span class="circulo-color" style="background:{{ otro.color.muestra }}"></span>
+                                        </a>
+                                    </li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="prod-add">
-                    <form action="{% url 'web:agregarCarrito' producto.id %}" method="post">
+                    {% if hay_stock %}
+                    <form action="{% url 'web:agregarCarrito' %}" method="post" id="form-agregar">
                         {% csrf_token %}
+                        <input type="hidden" name="sku" value="{{ variante.sku }}">
+
+                        {% if usa_atributo %}
                         <div class="variations">
                             <div class="variations-row">
-                                <div class="label"><label >Сolor</label></div>
+                                <div class="label"><label>{{ atributo.nombre }}</label></div>
                                 <div class="value">
-                                    <select>
-                                        <option value="">Choose an option</option>
-                                        <option value="blue">Blue</option>
-                                        <option value="green">Green</option>
-                                        <option value="yellow">Yellow</option>
-                                    </select>
+                                    <ul class="selector-tallas">
+                                        {% for item in items %}
+                                            <li>
+                                                <input type="radio"
+                                                       id="item-{{ item.id }}"
+                                                       name="item_id"
+                                                       value="{{ item.id }}"
+                                                       {% if not item.disponible %}disabled{% endif %}>
+                                                <label for="item-{{ item.id }}"
+                                                       class="{% if item.disponible %}talla-ok{% else %}talla-agotada{% endif %}"
+                                                       {% if not item.disponible %}title="Agotado"{% endif %}>
+                                                    {{ item.valor }}
+                                                </label>
+                                            </li>
+                                        {% endfor %}
+                                    </ul>
                                 </div>
                             </div>
                         </div>
-                        <button type="submit" class="button"><i class="icon ion-android-cart"></i> Agregar al Carrito</button>
-                        <p class="qnt-wrap prod-li-qnt">
-                            <a href="#" class="qnt-plus prod-li-plus"><i class="icon ion-arrow-up-b"></i></a>
-                            <input type="text" name="cantidad" value="1">
-                            <a href="#" class="qnt-minus prod-li-minus"><i class="icon ion-arrow-down-b"></i></a>
-                        </p>
+                        {% else %}
+                            {# la categoria no usa atributo (licuadora, TV): una sola unidad vendible #}
+                            {% for item in items %}
+                                {% if item.disponible %}
+                                    <input type="hidden" name="item_id" value="{{ item.id }}">
+                                {% endif %}
+                            {% endfor %}
+                        {% endif %}
+
+                        <div class="fila-agregar">
+                            <div class="contador">
+                                <button type="button" class="contador-btn" data-paso="-1" aria-label="Quitar uno">&minus;</button>
+                                <input type="number" name="cantidad" id="cantidad" value="1" min="1" readonly>
+                                <button type="button" class="contador-btn" data-paso="1" aria-label="Agregar uno">&plus;</button>
+                            </div>
+                            <button type="submit" class="button" id="btn-agregar">
+                                <i class="icon ion-android-cart"></i> Agregar al Carrito
+                            </button>
+                        </div>
                     </form>
+                    {% else %}
+                        <p class="sin-stock">Producto agotado</p>
+                    {% endif %}
                 </div>
-            </div>
-            <div class="prod-props">
-                <dl class="product_meta">
-                    
-                    
-                </dl>
             </div>
         </div>
     </div>
+    </article>
 
+    <style>
+        .selector-tallas,
+        .selector-colores {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+        }
+        .selector-tallas input[type="radio"] {
+            position: absolute;
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        .selector-tallas label {
+            display: block;
+            min-width: 46px;
+            padding: 10px 6px;
+            border: 1px solid #ccc;
+            border-radius: 3px;
+            text-align: center;
+            font-weight: 600;
+            cursor: pointer;
+            transition: border-color .15s, background .15s;
+        }
+        .selector-tallas label.talla-ok:hover { border-color: #222; }
+        .selector-tallas input:checked + label {
+            border-color: #222;
+            background: #222;
+            color: #fff;
+        }
+        .selector-tallas input:focus-visible + label {
+            outline: 2px solid #222;
+            outline-offset: 2px;
+        }
+        .selector-tallas label.talla-agotada {
+            color: #b0b0b0;
+            background: #f2f2f2;
+            border-color: #e2e2e2;
+            cursor: not-allowed;
+            text-decoration: line-through;
+        }
 
-    
+        .circulo-color {
+            display: block;
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            border: 1px solid rgba(0,0,0,.22);
+            box-shadow: inset 0 0 0 2px #fff;
+            cursor: pointer;
+            transition: transform .15s;
+        }
+        .selector-colores a:hover .circulo-color { transform: scale(1.12); }
+        .circulo-color.activo {
+            box-shadow: inset 0 0 0 2px #fff, 0 0 0 2px #222;
+            cursor: default;
+        }
 
-</article>
+        .fila-agregar {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin-top: 6px;
+        }
+        .contador {
+            display: inline-flex;
+            align-items: center;
+            border: 1px solid #ccc;
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        .contador-btn {
+            width: 38px;
+            height: 40px;
+            border: 0;
+            background: #f4f4f4;
+            font-size: 18px;
+            line-height: 1;
+            cursor: pointer;
+            color: #333;
+        }
+        .contador-btn:hover { background: #e6e6e6; }
+        .contador-btn:disabled { opacity: .4; cursor: not-allowed; }
+        .contador input[type="number"] {
+            width: 52px;
+            height: 40px;
+            border: 0;
+            border-left: 1px solid #ddd;
+            border-right: 1px solid #ddd;
+            text-align: center;
+            font-weight: 600;
+            -moz-appearance: textfield;
+            background: #fff;
+        }
+        .contador input::-webkit-outer-spin-button,
+        .contador input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 
+        .sin-stock {
+            padding: 14px 18px;
+            background: #f2f2f2;
+            border-left: 3px solid #b0b0b0;
+            color: #666;
+            font-weight: 600;
+        }
+
+        @keyframes carrito-pulso {
+            0%   { transform: scale(1); }
+            35%  { transform: scale(1.25); }
+            100% { transform: scale(1); }
+        }
+        .carrito-pulso { animation: carrito-pulso .5s ease; }
+        @media (prefers-reduced-motion: reduce) {
+            .carrito-pulso { animation: none; }
+        }
+    </style>
+
+    <script>
+    (function () {
+        var form = document.getElementById('form-agregar');
+        if (!form) return;
+
+        var cantidad = document.getElementById('cantidad');
+        var boton    = document.getElementById('btn-agregar');
+        var menos    = form.querySelector('.contador-btn[data-paso="-1"]');
+
+        function refrescarMenos() {
+            if (menos) menos.disabled = (parseInt(cantidad.value, 10) || 1) <= 1;
+        }
+        refrescarMenos();
+
+        // Botones - y + de cantidad
+        form.querySelectorAll('.contador-btn').forEach(function (btn) {
+            btn.addEventListener('click', function () {
+                var valor = parseInt(cantidad.value, 10) || 1;
+                var nuevo = valor + parseInt(btn.dataset.paso, 10);
+                if (nuevo < 1) return;
+                cantidad.value = nuevo;
+                refrescarMenos();
+            });
+        });
+
+        function pulsarCarrito() {
+            var icono = document.querySelector('#h-cart .h-cart-icon');
+            if (!icono) return;
+            icono.classList.remove('carrito-pulso');
+            void icono.offsetWidth;   // reinicia la animacion
+            icono.classList.add('carrito-pulso');
+        }
+
+        // Agregar al carrito sin salir de la pagina
+        form.addEventListener('submit', function (evento) {
+            evento.preventDefault();
+            boton.disabled = true;
+
+            fetch(form.action, {
+                method: 'POST',
+                body: new FormData(form),
+                headers: { 'X-Requested-With': 'XMLHttpRequest' }
+            })
+            .then(function (respuesta) { return respuesta.json(); })
+            .then(function (datos) {
+                window.mostrarAviso(datos.mensaje, !datos.ok);
+                if (datos.ok) {
+                    var contador = document.getElementById('cart-count');
+                    var total    = document.getElementById('cart-total');
+                    if (contador) contador.textContent = datos.lineas;
+                    if (total) total.textContent = datos.total;
+                    pulsarCarrito();
+                }
+            })
+            .catch(function () {
+                window.mostrarAviso('No pudimos agregar el producto. Intenta de nuevo.', true);
+            })
+            .finally(function () { boton.disabled = false; });
+        });
+    })();
+    </script>
 {% endblock %}

@@ -1,0 +1,63 @@
+{% extends "admin/change_list.html" %}
+
+{% block content_title %}
+    <h1>Inventario</h1>
+
+    <div class="resumen-inventario">
+        <div class="resumen-caja">
+            <p class="resumen-label">Unidades en stock</p>
+            <p class="resumen-valor">{{ total_unidades }}</p>
+        </div>
+        <div class="resumen-caja">
+            <p class="resumen-label">Costo de mercaderia</p>
+            <p class="resumen-valor">S/ {{ total_costo|floatformat:2 }}</p>
+        </div>
+        <div class="resumen-caja">
+            <p class="resumen-label">Valor a precio de venta</p>
+            <p class="resumen-valor">S/ {{ total_venta|floatformat:2 }}</p>
+        </div>
+        <div class="resumen-caja">
+            <p class="resumen-label">Ganancia proyectada</p>
+            <p class="resumen-valor">S/ {{ total_ganancia|floatformat:2 }}</p>
+        </div>
+        <div class="resumen-caja">
+            <p class="resumen-label">Tallas registradas</p>
+            <p class="resumen-valor">{{ total_filas }} <span class="resumen-nota">({{ total_agotados }} agotadas)</span></p>
+        </div>
+    </div>
+
+    <style>
+        .resumen-inventario {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin: 16px 0 20px;
+        }
+        .resumen-caja {
+            flex: 1 1 160px;
+            padding: 12px 16px;
+            border: 1px solid var(--hairline-color, #e0e0e0);
+            border-radius: 4px;
+            background: var(--darkened-bg, #f8f8f8);
+        }
+        .resumen-label {
+            margin: 0 0 6px;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--body-quiet-color, #666);
+        }
+        .resumen-valor {
+            margin: 0;
+            font-size: 20px;
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+            color: var(--body-fg, #333);
+        }
+        .resumen-nota {
+            font-size: 12px;
+            font-weight: 400;
+            color: var(--body-quiet-color, #666);
+        }
+    </style>
+{% endblock %}

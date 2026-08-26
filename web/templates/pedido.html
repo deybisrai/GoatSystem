@@ -1,102 +1,254 @@
 {% extends 'layout.html' %}
 {% block content %}
-<h1 class="maincont-ttl">REGISTRO DE PEDIDO</h1>
-    <ul class="b-crumbs">
-        <li><a href="/">Home</a></li>
-        <li>pedido</li>
-    </ul>
-    <form method="post" action="{#}" class="register">
+<h1 class="maincont-ttl">Confirmar pedido</h1>
+<ul class="b-crumbs">
+    <li><a href="{% url 'web:index' %}">Inicio</a></li>
+    <li><a href="{% url 'web:carrito' %}">Carrito</a></li>
+    <li>Pedido</li>
+</ul>
+
+{% if not user.is_authenticated %}
+<p class="aviso-invitado">
+    Estas comprando como invitado. Si prefieres,
+    <a href="{% url 'web:loginUsuario' %}?next={% url 'web:registrarPedido' %}">inicia sesion</a>
+    para guardar tus datos.
+</p>
+{% endif %}
+
+<form method="post" action="{% url 'web:registrarPedido' %}" class="checkout">
     {% csrf_token %}
-    <article class="page-cont">
-        <div class="page-styling">
-            <div class="auth-wrap">
-                <div class="auth-col">
-                    <h2>Datos Personales</h2>
-                    <p>
-                        <label for="username">Nombres<span class="required">*</span></label>
-                        {{frmCliente.nombre}}
+
+    <div class="checkout-grid">
+        <div class="checkout-datos">
+            <section class="bloque">
+                <h2>Datos personales</h2>
+                <div class="campos">
+                    <p class="campo">
+                        <label for="{{ frmPedido.nombre.id_for_label }}">Nombres <span class="req">*</span></label>
+                        {{ frmPedido.nombre }}
+                        {% for e in frmPedido.nombre.errors %}<span class="campo-error">{{ e }}</span>{% endfor %}
                     </p>
-                    <p>
-                        <label for="username">Apellidos<span class="required">*</span></label>
-                        {{frmCliente.apellidos}}
+                    <p class="campo">
+                        <label for="{{ frmPedido.apellidos.id_for_label }}">Apellidos <span class="req">*</span></label>
+                        {{ frmPedido.apellidos }}
+                        {% for e in frmPedido.apellidos.errors %}<span class="campo-error">{{ e }}</span>{% endfor %}
                     </p>
-                    <p>
-                        <label for="username">Email<span class="required">*</span></label>
-                        {{frmCliente.email}}
+                    <p class="campo">
+                        <label for="{{ frmPedido.email.id_for_label }}">Email <span class="req">*</span></label>
+                        {{ frmPedido.email }}
+                        {% for e in frmPedido.email.errors %}<span class="campo-error">{{ e }}</span>{% endfor %}
+                    </p>
+                    <p class="campo">
+                        <label for="{{ frmPedido.telefono.id_for_label }}">Telefono <span class="req">*</span></label>
+                        {{ frmPedido.telefono }}
+                        {% for e in frmPedido.telefono.errors %}<span class="campo-error">{{ e }}</span>{% endfor %}
+                    </p>
+                    <p class="campo">
+                        <label for="{{ frmPedido.dni.id_for_label }}">DNI</label>
+                        {{ frmPedido.dni }}
+                        {% for e in frmPedido.dni.errors %}<span class="campo-error">{{ e }}</span>{% endfor %}
                     </p>
                 </div>
-                <div class="auth-col">
-                    <h2>Datos Envio</h2>
-                    <p>
-                        <label for="username">Telefono<span class="required">*</span></label>
-                        {{frmCliente.telefono}}
+            </section>
+
+            <section class="bloque">
+                <h2>Direccion de envio</h2>
+                <div class="campos">
+                    <p class="campo campo-ancho">
+                        <label for="{{ frmPedido.direccion.id_for_label }}">Direccion <span class="req">*</span></label>
+                        {{ frmPedido.direccion }}
+                        {% for e in frmPedido.direccion.errors %}<span class="campo-error">{{ e }}</span>{% endfor %}
                     </p>
-                    <p>
-                        <label for="username">Dirección<span class="required">*</span></label>
-                        {{frmCliente.direccion}}
+                    <p class="campo campo-ancho">
+                        <label for="{{ frmPedido.referencia.id_for_label }}">Referencia</label>
+                        {{ frmPedido.referencia }}
+                    </p>
+                    <p class="campo">
+                        <label for="{{ frmPedido.departamento.id_for_label }}">Departamento <span class="req">*</span></label>
+                        {{ frmPedido.departamento }}
+                        {% for e in frmPedido.departamento.errors %}<span class="campo-error">{{ e }}</span>{% endfor %}
+                    </p>
+                    <p class="campo">
+                        <label for="{{ frmPedido.provincia.id_for_label }}">Provincia <span class="req">*</span></label>
+                        {{ frmPedido.provincia }}
+                        {% for e in frmPedido.provincia.errors %}<span class="campo-error">{{ e }}</span>{% endfor %}
+                    </p>
+                    <p class="campo">
+                        <label for="{{ frmPedido.distrito.id_for_label }}">Distrito <span class="req">*</span></label>
+                        {{ frmPedido.distrito }}
+                        {% for e in frmPedido.distrito.errors %}<span class="campo-error">{{ e }}</span>{% endfor %}
                     </p>
                 </div>
-            </div>
+            </section>
         </div>
-    </article>
-    <article class="page-cont">
-        <div class="page-styling">
-            <h2>Confirmación de Productos</h2>
-            <div class="woocommerce prod-litems section-list">
-                {% for key,value in request.session.cart.items %}
-                <article class="prod-li sectls">
-                    <div class="prod-li-inner">
-                        <a href="#" class="prod-li-img">
-                            <img src="{{ value.imagen }}" alt="">
-                        </a>
-                        <div class="prod-li-cont">
-                            <div class="prod-li-ttl-wrap">
-                                <p>
-                                    <a href="#">value.categoria</a>
-                                </p>
-                                <h3><a href="product.html">{{ value.nombre }}</a></h3>
-                            </div>
-                            <div class="prod-li-prices">
-                                <div class="prod-li-price-wrap">
-                                    <p>Precio</p>
-                                    <p class="prod-li-price">s/ {{value.precio}}</p>
-                                </div>
-                            </div>
-                            <div class="prod-li-qnt-wrap">
-                                <p class="qnt-wrap prod-li-qnt">
-                                    <a href="#" class="qnt-plus prod-li-plus"><i class="icon ion-arrow-up-b"></i></a>
-                                    <input type="text" value="{{value.cantidad}}">
-                                    <a href="#" class="qnt-minus prod-li-minus"><i class="icon ion-arrow-down-b"></i></a>
-                                </p>
-                            </div>
-                            <div class="prod-li-total-wrap">
-                                <p>Total</p>
-                                <p class="prod-li-total">s/ {{value.subtotal}}</p>
-                            </div>
-                        </div>
-                    </div>
-                </article>
+
+        <aside class="checkout-resumen">
+            <h2>Tu pedido</h2>
+            <ul class="resumen-items">
+                {% for linea in carrito %}
+                <li class="resumen-item">
+                    <span class="ri-img">
+                        {% if linea.imagen %}<img src="{{ linea.imagen }}" alt="">{% endif %}
+                    </span>
+                    <span class="ri-texto">
+                        <b>{{ linea.nombre }}</b>
+                        <small>{{ linea.color }}{% if linea.valor %} &middot; {{ linea.atributo }} {{ linea.valor }}{% endif %}</small>
+                        <small>{{ linea.cantidad }} &times; s/{{ linea.precio }}</small>
+                    </span>
+                    <span class="ri-subtotal">s/{{ linea.subtotal }}</span>
+                </li>
                 {% endfor %}
-        </div>
-        <div class="cart-actions">
-                <div class="cart-collaterals">
-                    <div class="order-total">
-                        <p class="cart-totals-ttl">Total</p>
-                        <p class="cart-totals-val">s/ {{request.session.cartMontoTotal}}</p
-                    </div>
-                </div>
-        </div>
-        </div>
-    </article>
-    <article class="page-cont">
-        <div class="page-styling">
-            <div class="auth-wrap">
-                <div class="auth-col">
-                    <p class="auth-submit">
-                        <input type="submit" value="Confirmar Pedido">
-                    </p>
+            </ul>
+
+            <div class="resumen-linea">
+                <span>Subtotal</span>
+                <span>s/{{ carrito.subtotal }}</span>
             </div>
-        </div>
-    </article>
-    </form>
+            {% if carrito.descuento %}
+            <div class="resumen-linea resumen-descuento">
+                <span>Descuento ({{ carrito.cupon.codigo }})</span>
+                <span>&minus;s/{{ carrito.descuento }}</span>
+            </div>
+            {% endif %}
+            <div class="resumen-total">
+                <span>Total</span>
+                <b>s/{{ carrito.total }}</b>
+            </div>
+
+            <button type="submit" class="button boton-confirmar">Confirmar pedido</button>
+            <a href="{% url 'web:carrito' %}" class="volver-carrito">Volver al carrito</a>
+        </aside>
+    </div>
+</form>
+
+<style>
+    .aviso-invitado {
+        padding: 12px 16px;
+        background: #f4f6f8;
+        border-left: 3px solid #9aa7b1;
+        margin: 18px 0;
+        font-size: 14px;
+    }
+
+    .checkout-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 340px;
+        gap: 24px;
+        align-items: start;
+        margin: 24px 0 50px;
+    }
+
+    .bloque {
+        background: #fff;
+        border: 1px solid #e6e6e6;
+        border-radius: 4px;
+        padding: 22px 24px;
+        margin-bottom: 18px;
+    }
+    .bloque h2 {
+        margin: 0 0 18px;
+        font-size: 18px;
+    }
+
+    .campos {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 16px;
+    }
+    .campo { margin: 0; display: flex; flex-direction: column; gap: 6px; }
+    .campo-ancho { grid-column: 1 / -1; }
+    .campo label {
+        font-size: 12px;
+        letter-spacing: .04em;
+        text-transform: uppercase;
+        color: #6a6a6a;
+    }
+    .req { color: #b5541b; }
+    .campo input[type="text"],
+    .campo input[type="email"],
+    .campo input {
+        width: 100%;
+        height: 42px;
+        padding: 0 12px;
+        border: 1px solid #d5d5d5;
+        border-radius: 3px;
+        background: #fff;
+    }
+    .campo input:focus {
+        outline: none;
+        border-color: #222;
+    }
+    .campo-error {
+        font-size: 12px;
+        color: #b5541b;
+    }
+
+    .checkout-resumen {
+        background: #fff;
+        border: 1px solid #e6e6e6;
+        border-radius: 4px;
+        padding: 22px 20px;
+        position: sticky;
+        top: 90px;
+    }
+    .checkout-resumen h2 { margin: 0 0 16px; font-size: 18px; }
+
+    .resumen-items { list-style: none; margin: 0; padding: 0; }
+    .resumen-item {
+        display: grid;
+        grid-template-columns: 52px minmax(0, 1fr) auto;
+        gap: 10px;
+        align-items: center;
+        padding: 10px 0;
+        border-bottom: 1px solid #f0f0f0;
+    }
+    .ri-img img { width: 52px; height: 52px; object-fit: contain; }
+    .ri-texto { display: flex; flex-direction: column; min-width: 0; }
+    .ri-texto b { font-size: 14px; }
+    .ri-texto small { font-size: 12px; color: #8c8c8c; }
+    .ri-subtotal { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+    .resumen-linea {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        font-size: 14px;
+        padding-top: 12px;
+        font-variant-numeric: tabular-nums;
+    }
+    .resumen-descuento { color: #3e7a4c; }
+    .resumen-total {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        margin-top: 12px;
+        padding: 14px 0 18px;
+        border-top: 1px solid #ececec;
+        font-size: 15px;
+    }
+    .resumen-total b { font-size: 24px; font-variant-numeric: tabular-nums; }
+
+    .boton-confirmar {
+        display: block;
+        width: 100%;
+        text-align: center;
+        border: 0;
+        cursor: pointer;
+        padding: 14px;
+        font-size: 14px;
+    }
+    .volver-carrito {
+        display: block;
+        text-align: center;
+        margin-top: 12px;
+        font-size: 13px;
+        color: #8c8c8c;
+    }
+
+    @media (max-width: 900px) {
+        .checkout-grid { grid-template-columns: 1fr; }
+        .checkout-resumen { position: static; }
+        .campos { grid-template-columns: 1fr; }
+    }
+</style>
 {% endblock %}
