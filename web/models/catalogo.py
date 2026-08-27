@@ -124,6 +124,11 @@ class Categoria(models.Model):
         'Usa genero', default=False,
         help_text='Marcar solo en moda (calzado, ropa). En tecnologia o electrodomesticos no aplica.'
     )
+    trasladable = models.BooleanField(
+        default=True,
+        help_text='Si los productos de esta categoria pueden viajar entre ciudades. '
+                  'Una refrigeradora cuesta mas trasladarla que lo que deja la venta.',
+    )
     activo = models.BooleanField(default=True)
     fecha_registro = models.DateTimeField(auto_now_add=True)
 
@@ -182,6 +187,11 @@ class Producto(models.Model):
         max_length=1, choices=GENERO_CHOICES, blank=True,
         help_text='Solo para moda. Dejar vacio en electrodomesticos, tecnologia, etc.'
     )
+    trasladable = models.BooleanField(
+        null=True, blank=True,
+        help_text='Vacio = como su categoria. Solo para la excepcion puntual: '
+                  'un microondas chico que si viaja, un producto fragil que no.',
+    )
     activo = models.BooleanField(default=True)
     creado = models.DateTimeField(auto_now_add=True)
     actualizado = models.DateTimeField(auto_now=True)
@@ -208,6 +218,13 @@ class Producto(models.Model):
         if not self.slug:
             self.slug = slugify(self.nombre)
         super().save(*args, **kwargs)
+
+    @property
+    def se_traslada(self):
+        """ Si puede ofrecerse en una ciudad donde no esta fisicamente """
+        if self.trasladable is None:
+            return self.categoria.trasladable
+        return self.trasladable
 
     def curvas_disponibles(self):
         return Curva.aplicables(self.categoria, self.genero)

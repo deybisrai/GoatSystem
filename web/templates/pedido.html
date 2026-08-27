@@ -52,8 +52,23 @@
             </section>
 
             <section class="bloque">
-                <h2>Direccion de envio</h2>
-                <div class="campos">
+                <h2>Como quieres recibirlo</h2>
+
+                <div class="modos">
+                    {% for opcion in frmPedido.modo_entrega %}
+                    <label class="modo">
+                        {{ opcion.tag }}
+                        <span class="modo-txt">
+                            <b>{{ opcion.choice_label }}</b>
+                            <small>{% if opcion.data.value == 'E' %}Te lo llevamos a tu direccion{% else %}Lo retiras en uno de nuestros puntos{% endif %}</small>
+                        </span>
+                    </label>
+                    {% endfor %}
+                </div>
+                {% for e in frmPedido.modo_entrega.errors %}<span class="campo-error">{{ e }}</span>{% endfor %}
+
+                <!-- ---------- envio a domicilio ---------- -->
+                <div class="campos entrega-envio">
                     <p class="campo campo-ancho">
                         <label for="{{ frmPedido.direccion.id_for_label }}">Direccion <span class="req">*</span></label>
                         {{ frmPedido.direccion }}
@@ -77,6 +92,51 @@
                         <label for="{{ frmPedido.distrito.id_for_label }}">Distrito <span class="req">*</span></label>
                         {{ frmPedido.distrito }}
                         {% for e in frmPedido.distrito.errors %}<span class="campo-error">{{ e }}</span>{% endfor %}
+                    </p>
+                </div>
+
+                <!-- ---------- recojo en un punto ---------- -->
+                <div class="entrega-recojo" hidden>
+                    {% for e in frmPedido.punto_recojo.errors %}<span class="campo-error">{{ e }}</span>{% endfor %}
+
+                    <div class="puntos">
+                        {% for oferta in ofertas %}
+                        {% with punto=oferta.punto %}
+                        <label class="punto{% if oferta.clave != 'hoy' and oferta.clave != 'encargo' %} punto-no{% endif %}"
+                               for="punto-{{ punto.id }}">
+                            <input type="radio" name="punto_recojo" value="{{ punto.id }}"
+                                   id="punto-{{ punto.id }}"
+                                   {% if oferta.clave != 'hoy' and oferta.clave != 'encargo' %}disabled{% endif %}
+                                   {% if frmPedido.punto_recojo.value|stringformat:'s' == punto.id|stringformat:'s' %}checked{% endif %}>
+                            <span class="punto-txt">
+                                <b>{{ punto.nombre }}</b>
+                                <span class="punto-dir">{{ punto.direccion_completa }}</span>
+                                {% if punto.horario %}
+                                <span class="punto-horario">{{ punto.horario }}</span>
+                                {% else %}
+                                <span class="punto-horario punto-sin-horario">Consulta el horario al recoger</span>
+                                {% endif %}
+
+                                {% if oferta.clave == 'hoy' %}
+                                <span class="punto-listo">Retiralo hoy</span>
+                                {% elif oferta.clave == 'encargo' %}
+                                <span class="punto-encargo">Llega el {{ oferta.fecha|date:"l j \d\e F" }}</span>
+                                {% elif oferta.clave == 'lejos' %}
+                                <span class="punto-lejos">Este producto no se traslada entre ciudades</span>
+                                {% elif oferta.clave == 'sin_viaje' %}
+                                <span class="punto-lejos">Sin transporte programado a esta ciudad</span>
+                                {% else %}
+                                <span class="punto-lejos">Sin stock para este punto</span>
+                                {% endif %}
+                            </span>
+                        </label>
+                        {% endwith %}
+                        {% endfor %}
+                    </div>
+
+                    <p class="puntos-nota">
+                        Te avisamos apenas tu pedido este listo para recoger. Si el producto
+                        esta en otra ciudad lo trasladamos sin costo, y te confirmamos la fecha.
                     </p>
                 </div>
             </section>
@@ -251,4 +311,76 @@
         .campos { grid-template-columns: 1fr; }
     }
 </style>
+
+<style>
+    /* El bloque de envio lleva la clase .campos, que el theme pinta como grid, y
+       esa regla de autor le gana al [hidden] del navegador: los campos quedaban
+       visibles con el recojo elegido. Con el atributo en el selector, la regla
+       propia gana por especificidad y no hace falta !important. */
+    .entrega-envio[hidden],
+    .entrega-recojo[hidden] { display: none; }
+
+    .modos { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 18px; }
+    .modo {
+        flex: 1 1 220px;
+        display: flex; align-items: flex-start; gap: 10px;
+        padding: 13px 15px; margin: 0;
+        border: 1px solid #ddd; border-radius: 4px;
+        cursor: pointer;
+        transition: border-color .15s, background .15s;
+    }
+    .modo:hover { border-color: #999; }
+    .modo:has(input:checked) { border-color: #1f1f1f; background: #f6f6f6; }
+    .modo:has(input:focus-visible) { outline: 2px solid #1f1f1f; outline-offset: 2px; }
+    .modo input { margin: 3px 0 0; flex: 0 0 auto; }
+    .modo-txt { display: flex; flex-direction: column; gap: 2px; }
+    .modo-txt small { color: #8c8c8c; font-size: 12.5px; }
+
+    .puntos { display: flex; flex-direction: column; gap: 8px; }
+    .punto {
+        display: flex; align-items: flex-start; gap: 10px;
+        padding: 12px 15px; margin: 0;
+        border: 1px solid #ddd; border-radius: 4px;
+        cursor: pointer;
+        transition: border-color .15s, background .15s;
+    }
+    .punto:hover { border-color: #999; }
+    .punto:has(input:checked) { border-color: #1f1f1f; background: #f6f6f6; }
+    .punto:has(input:focus-visible) { outline: 2px solid #1f1f1f; outline-offset: 2px; }
+    .punto input { margin: 3px 0 0; flex: 0 0 auto; }
+    .punto-txt { display: flex; flex-direction: column; gap: 2px; font-size: 14px; }
+    .punto-dir { color: #4a4a4a; font-size: 13px; }
+    .punto-horario { color: #8c8c8c; font-size: 12.5px; }
+    .punto-sin-horario { font-style: italic; }
+    .punto-listo { color: #3e7a4c; font-size: 13px; font-weight: 600; }
+    .punto-encargo { color: #97711a; font-size: 13px; font-weight: 600; }
+    .punto-lejos { color: #b5541b; font-size: 13px; }
+    .punto-no { opacity: .6; cursor: not-allowed; }
+    .punto-no:hover { border-color: #ddd; }
+
+    .puntos-nota {
+        margin: 14px 0 0; color: #8c8c8c; font-size: 13px; line-height: 1.6;
+    }
+</style>
+
+<script>
+(function () {
+    // se muestra el bloque del modo elegido y se esconde el otro
+    var modos = document.querySelectorAll('input[name="modo_entrega"]');
+    var envio = document.querySelector('.entrega-envio');
+    var recojo = document.querySelector('.entrega-recojo');
+    if (!modos.length || !envio || !recojo) return;
+
+    function mostrar(valor) {
+        var esRecojo = valor === 'R';
+        envio.hidden = esRecojo;
+        recojo.hidden = !esRecojo;
+    }
+    modos.forEach(function (radio) {
+        radio.addEventListener('change', function () { mostrar(radio.value); });
+        if (radio.checked) mostrar(radio.value);
+    });
+})();
+</script>
+
 {% endblock %}

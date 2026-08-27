@@ -1,0 +1,472 @@
+{% extends 'layout.html' %}
+{% block content %}
+<div class="pg">
+
+    <div class="pg-head">
+        <h1>Ya casi. Falta el pago.</h1>
+        <p class="pg-sub">
+            Pedido <b>{{ pedido.nro_pedido }}</b> &middot; guardamos tus productos mientras pagas.
+        </p>
+    </div>
+
+    <div class="pg-monto">
+        <span class="pg-monto-rot">Monto a pagar</span>
+        <b class="pg-monto-cifra" id="pg-total">s/{{ pedido.monto_total }}</b>
+        <button type="button" class="pg-copiar" data-copiar="{{ pedido.monto_total }}">Copiar</button>
+    </div>
+
+    {% if segundos %}
+    <div class="pg-reloj" data-segundos="{{ segundos }}">
+        <span class="pg-reloj-rot">Te guardamos el producto por</span>
+        <b class="pg-reloj-cifra" id="pg-reloj">--:--</b>
+        <span class="pg-reloj-nota">
+            Transferir no alcanza: para que quede reservado tenes que enviarnos el
+            comprobante antes de que llegue a cero.
+        </span>
+    </div>
+    {% endif %}
+
+    {% if vencido %}
+    <div class="pg-estado pg-estado-rechazo">
+        <b>Se vencio el plazo y soltamos las unidades.</b>
+        Otra persona ya puede comprarlas.
+        <span class="pg-estado-pie">
+            <b>Si ya transferiste, mandanos el comprobante igual.</b> Lo revisamos
+            y, si el producto sigue disponible, te lo despachamos; si no, te
+            devolvemos el dinero. No te quedes sin avisarnos.
+        </span>
+    </div>
+    {% endif %}
+
+    {% if pendiente %}
+        <div class="pg-estado pg-estado-espera">
+            <b>Recibimos tu comprobante.</b>
+            Operacion <b>{{ pendiente.nro_operacion }}</b>, enviada el {{ pendiente.creado|date:"d/m/Y H:i" }}.
+            Estamos verificandola contra nuestra cuenta y te escribimos a
+            <b>{{ pedido.email_comprador }}</b> apenas quede confirmada.
+        </div>
+
+    {% else %}
+
+        {% if rechazo %}
+        <div class="pg-estado pg-estado-rechazo">
+            <b>No pudimos confirmar tu comprobante anterior.</b>
+            {{ rechazo.motivo_rechazo }}
+            <span class="pg-estado-pie">Puedes enviarnos otro con los datos corregidos.</span>
+        </div>
+        {% endif %}
+
+        <div class="pg-grid">
+
+            <!-- ============ donde pagar ============ -->
+            <section class="pg-col">
+                <h2 class="pg-h2"><span class="pg-paso">1</span> Paga a una de estas cuentas</h2>
+
+                <div class="pg-metodos">
+                    {% for cuenta in cuentas %}
+                    <label class="pg-metodo" for="metodo-{{ cuenta.id }}">
+                        <input type="radio" name="cuenta" value="{{ cuenta.id }}"
+                               id="metodo-{{ cuenta.id }}" form="frm-pago"
+                               {% if forloop.first %}checked{% endif %}>
+                        <span class="pg-metodo-txt">{{ cuenta.etiqueta }}</span>
+                    </label>
+                    {% endfor %}
+                </div>
+
+                {% for cuenta in cuentas %}
+                <div class="pg-detalle" data-cuenta="{{ cuenta.id }}"
+                     {% if not forloop.first %}hidden{% endif %}>
+
+                    <p class="pg-titular">A nombre de <b>{{ cuenta.titular }}</b></p>
+
+                    {% if cuenta.imagen_qr %}
+                    <div class="pg-qr">
+                        <a href="{{ cuenta.imagen_qr.url }}" target="_blank" rel="noopener">
+                            <img src="{{ cuenta.imagen_qr.url }}" alt="Codigo QR de {{ cuenta.titular }}">
+                        </a>
+                        <span class="pg-qr-nota">
+                            Tocalo para verlo grande y guardarlo en tu galeria: Yape tambien
+                            escanea codigos desde ahi.
+                        </span>
+                    </div>
+                    {% endif %}
+
+                    {% if cuenta.es_bancaria %}
+                    <dl class="pg-datos">
+                        <div>
+                            <dt>Banco</dt>
+                            <dd>{{ cuenta.banco }} &middot; {{ cuenta.get_tipo_cuenta_display }}</dd>
+                        </div>
+                        <div>
+                            <dt>Numero de cuenta</dt>
+                            <dd class="pg-num">
+                                <span>{{ cuenta.numero }}</span>
+                                <button type="button" class="pg-copiar" data-copiar="{{ cuenta.numero }}">Copiar</button>
+                            </dd>
+                        </div>
+                        {% if cuenta.cci %}
+                        <div>
+                            <dt>CCI</dt>
+                            <dd class="pg-num">
+                                <span>{{ cuenta.cci }}</span>
+                                <button type="button" class="pg-copiar" data-copiar="{{ cuenta.cci }}">Copiar</button>
+                            </dd>
+                        </div>
+                        {% endif %}
+                        <div>
+                            <dt>Moneda</dt>
+                            <dd>{{ cuenta.get_moneda_display }}</dd>
+                        </div>
+                    </dl>
+                    {% endif %}
+
+                    {% if cuenta.usa_telefono %}
+                    <dl class="pg-datos">
+                        <div>
+                            <dt>Numero de {{ cuenta.get_metodo_display }}</dt>
+                            <dd class="pg-num">
+                                <span>{{ cuenta.telefono }}</span>
+                                <button type="button" class="pg-copiar" data-copiar="{{ cuenta.telefono }}">Copiar</button>
+                            </dd>
+                        </div>
+                    </dl>
+                    {% endif %}
+
+                    {% if cuenta.instrucciones %}
+                    <p class="pg-instrucciones">{{ cuenta.instrucciones }}</p>
+                    {% endif %}
+                </div>
+                {% endfor %}
+
+                <div class="pg-resumen">
+                    <h3>Tu pedido</h3>
+                    <ul>
+                        {% for detalle in pedido.detalles.all %}
+                        <li>
+                            <span>
+                                {{ detalle.nombre_producto }}
+                                <small>{% if detalle.valor %}{{ detalle.valor }} &middot; {% endif %}{{ detalle.sku }}</small>
+                            </span>
+                            <span class="pg-r-cant">{{ detalle.cantidad }} &times;</span>
+                            <span class="pg-r-sub">s/{{ detalle.subtotal }}</span>
+                        </li>
+                        {% endfor %}
+                    </ul>
+                    {% if pedido.descuento_aplicado %}
+                    <p class="pg-r-desc">
+                        <span>Descuento ({{ pedido.cupon.codigo }})</span>
+                        <span>&minus;s/{{ pedido.descuento_aplicado }}</span>
+                    </p>
+                    {% endif %}
+                </div>
+            </section>
+
+            <!-- ============ declarar el pago ============ -->
+            <section class="pg-col">
+                <h2 class="pg-h2"><span class="pg-paso">2</span> Cuentanos que ya pagaste</h2>
+
+                <form method="post" enctype="multipart/form-data" id="frm-pago" class="pg-form">
+                    {% csrf_token %}
+
+                    {% if frmPago.cuenta.errors %}
+                    <p class="pg-error">{{ frmPago.cuenta.errors.0 }}</p>
+                    {% endif %}
+
+                    <div class="pg-campo">
+                        <label for="{{ frmPago.nro_operacion.id_for_label }}">Numero de operacion</label>
+                        {{ frmPago.nro_operacion }}
+                        <small>El que te dio tu banco o Yape al transferir.</small>
+                        {% for error in frmPago.nro_operacion.errors %}
+                        <p class="pg-error">{{ error }}</p>
+                        {% endfor %}
+                    </div>
+
+                    <div class="pg-fila">
+                        <div class="pg-campo">
+                            <label for="{{ frmPago.monto_declarado.id_for_label }}">Monto transferido</label>
+                            {{ frmPago.monto_declarado }}
+                            {% for error in frmPago.monto_declarado.errors %}
+                            <p class="pg-error">{{ error }}</p>
+                            {% endfor %}
+                        </div>
+                        <div class="pg-campo">
+                            <label for="{{ frmPago.fecha_pago.id_for_label }}">Fecha del pago</label>
+                            {{ frmPago.fecha_pago }}
+                            {% for error in frmPago.fecha_pago.errors %}
+                            <p class="pg-error">{{ error }}</p>
+                            {% endfor %}
+                        </div>
+                    </div>
+
+                    <div class="pg-campo">
+                        <label for="{{ frmPago.voucher.id_for_label }}">Captura del comprobante</label>
+                        {{ frmPago.voucher }}
+                        <small>Una imagen de hasta 1 MB. Que se lean el monto y el numero de operacion.</small>
+                        {% for error in frmPago.voucher.errors %}
+                        <p class="pg-error">{{ error }}</p>
+                        {% endfor %}
+                    </div>
+
+                    <button type="submit" class="pg-enviar">Enviar comprobante</button>
+
+                    <p class="pg-nota">
+                        Verificamos contra nuestra cuenta antes de despachar. Si algo no coincide
+                        te escribimos a {{ pedido.email_comprador }}.
+                    </p>
+                </form>
+            </section>
+
+        </div>
+    {% endif %}
+
+    <p class="pg-salida"><a href="{% url 'web:index' %}">Seguir comprando</a></p>
+</div>
+
+<style>
+    .pg { max-width: 980px; margin: 34px auto 70px; }
+
+    .pg-head { text-align: center; margin-bottom: 22px; }
+    .pg-head h1 { margin: 0 0 8px; font-size: 27px; }
+    .pg-sub { color: #6a6a6a; margin: 0; }
+
+    .pg-monto {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        flex-wrap: wrap;
+        background: #fff;
+        border: 1px solid #e6e6e6;
+        border-radius: 4px;
+        padding: 16px 22px;
+        margin-bottom: 22px;
+    }
+    .pg-monto-rot { color: #8c8c8c; font-size: 13px; text-transform: uppercase; letter-spacing: .05em; }
+    .pg-monto-cifra { font-size: 30px; font-variant-numeric: tabular-nums; line-height: 1; }
+
+    .pg-reloj {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        flex-wrap: wrap;
+        background: #fdf6e9;
+        border: 1px solid #efdfc0;
+        border-left: 3px solid #97711a;
+        border-radius: 4px;
+        padding: 12px 20px;
+        margin: -8px 0 22px;
+        text-align: center;
+    }
+    .pg-reloj-rot { color: #7d6216; font-size: 14px; }
+    .pg-reloj-cifra {
+        font-size: 24px;
+        font-variant-numeric: tabular-nums;
+        color: #7d6216;
+        line-height: 1;
+        min-width: 68px;
+    }
+    .pg-reloj-cifra.pg-apura { color: #b5541b; }
+    .pg-reloj-nota { flex: 1 1 100%; color: #8a7a55; font-size: 13px; line-height: 1.5; }
+
+    .pg-estado {
+        border: 1px solid #e6e6e6;
+        border-left: 3px solid #3e7a4c;
+        border-radius: 4px;
+        background: #fff;
+        padding: 16px 20px;
+        margin-bottom: 22px;
+        line-height: 1.6;
+    }
+    .pg-estado-rechazo { border-left-color: #b5541b; }
+    .pg-estado-pie { display: block; margin-top: 6px; color: #6a6a6a; font-size: 14px; }
+
+    .pg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: start; }
+
+    .pg-col {
+        background: #fff;
+        border: 1px solid #e6e6e6;
+        border-radius: 4px;
+        padding: 22px 24px;
+    }
+    .pg-h2 { display: flex; align-items: center; gap: 10px; margin: 0 0 18px; font-size: 16px; }
+    .pg-paso {
+        flex: 0 0 auto;
+        width: 24px; height: 24px;
+        display: inline-flex; align-items: center; justify-content: center;
+        border-radius: 50%;
+        background: #1f1f1f; color: #fff;
+        font-size: 13px; font-weight: 700;
+    }
+
+    .pg-metodos { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
+    .pg-metodo {
+        display: inline-flex; align-items: center; gap: 7px;
+        padding: 9px 14px;
+        border: 1px solid #ddd; border-radius: 4px;
+        cursor: pointer; margin: 0;
+        font-size: 14px;
+        transition: border-color .15s, background .15s;
+    }
+    .pg-metodo:hover { border-color: #999; }
+    .pg-metodo:has(input:checked) { border-color: #1f1f1f; background: #f6f6f6; }
+    .pg-metodo:has(input:focus-visible) { outline: 2px solid #1f1f1f; outline-offset: 2px; }
+    .pg-metodo input { margin: 0; }
+    .pg-metodo-txt { white-space: nowrap; }
+
+    .pg-titular { margin: 0 0 14px; color: #4a4a4a; }
+
+    .pg-qr { text-align: center; margin-bottom: 16px; }
+    .pg-qr img {
+        /* el QR que entrega Yape viene vertical y con mucho margen: a 220px el
+           codigo en si quedaba en 150px, incomodo de escanear desde la pantalla */
+        max-width: 300px; width: 100%; height: auto;
+        border: 1px solid #eee; border-radius: 4px;
+    }
+    .pg-qr-nota {
+        display: block; margin-top: 8px;
+        color: #8c8c8c; font-size: 12.5px; line-height: 1.5;
+    }
+
+    .pg-datos { margin: 0; }
+    .pg-datos > div {
+        display: flex; justify-content: space-between; align-items: baseline;
+        gap: 14px; padding: 9px 0; border-bottom: 1px solid #f0f0f0;
+    }
+    .pg-datos dt { color: #8c8c8c; font-size: 13px; font-weight: 400; }
+    .pg-datos dd { margin: 0; font-weight: 600; text-align: right; }
+    .pg-num { display: flex; align-items: center; gap: 8px; font-variant-numeric: tabular-nums; }
+
+    .pg-copiar {
+        border: 1px solid #ddd; background: #fff; border-radius: 3px;
+        padding: 3px 9px; font-size: 12px; cursor: pointer; color: #4a4a4a;
+        white-space: nowrap;
+    }
+    .pg-copiar:hover { border-color: #999; }
+    .pg-copiar.pg-copiado { border-color: #3e7a4c; color: #3e7a4c; }
+
+    .pg-instrucciones { margin: 14px 0 0; color: #6a6a6a; font-size: 14px; }
+
+    .pg-resumen { margin-top: 24px; padding-top: 18px; border-top: 1px solid #eee; }
+    .pg-resumen h3 { margin: 0 0 10px; font-size: 14px; color: #8c8c8c; text-transform: uppercase; letter-spacing: .05em; }
+    .pg-resumen ul { list-style: none; margin: 0; padding: 0; }
+    .pg-resumen li {
+        display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
+        gap: 12px; align-items: baseline; padding: 7px 0; font-size: 14px;
+    }
+    .pg-resumen small { display: block; color: #8c8c8c; font-size: 12px; }
+    .pg-r-cant { color: #8c8c8c; font-size: 13px; }
+    .pg-r-sub { font-weight: 600; font-variant-numeric: tabular-nums; }
+    .pg-r-desc {
+        display: flex; justify-content: space-between;
+        margin: 8px 0 0; font-size: 14px; color: #3e7a4c;
+        font-variant-numeric: tabular-nums;
+    }
+
+    .pg-campo { margin-bottom: 16px; }
+    .pg-campo label { display: block; margin-bottom: 5px; font-size: 14px; font-weight: 600; }
+    .pg-campo small { display: block; margin-top: 5px; color: #8c8c8c; font-size: 12.5px; }
+    .pg-campo input[type="text"],
+    .pg-campo input[type="number"],
+    .pg-campo input[type="date"],
+    .pg-campo input[type="file"] {
+        width: 100%;
+        padding: 10px 12px;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        font-size: 14px;
+        background: #fff;
+    }
+    .pg-campo input:focus { border-color: #1f1f1f; outline: none; }
+
+    .pg-fila { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+
+    .pg-error { margin: 6px 0 0; color: #b5541b; font-size: 13px; }
+
+    .pg-enviar {
+        width: 100%;
+        padding: 13px;
+        border: 0; border-radius: 4px;
+        background: #1f1f1f; color: #fff;
+        font-size: 15px; font-weight: 600; cursor: pointer;
+        margin-top: 4px;
+    }
+    .pg-enviar:hover { background: #000; }
+
+    .pg-nota { margin: 14px 0 0; color: #8c8c8c; font-size: 13px; line-height: 1.6; }
+
+    .pg-salida { text-align: center; margin: 26px 0 0; }
+    .pg-salida a { color: #6a6a6a; }
+
+    @media (max-width: 860px) {
+        .pg-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 480px) {
+        .pg-fila { grid-template-columns: 1fr; }
+        .pg-resumen li { grid-template-columns: 1fr auto; }
+        .pg-r-cant { grid-column: 1 / -1; }
+    }
+</style>
+
+<script>
+(function () {
+    // mostrar los datos de la cuenta elegida
+    var metodos = document.querySelectorAll('.pg-metodo input[name="cuenta"]');
+    var detalles = document.querySelectorAll('.pg-detalle');
+
+    function mostrar(id) {
+        detalles.forEach(function (bloque) {
+            bloque.hidden = bloque.dataset.cuenta !== id;
+        });
+    }
+    metodos.forEach(function (radio) {
+        radio.addEventListener('change', function () { mostrar(radio.value); });
+        if (radio.checked) mostrar(radio.value);
+    });
+
+    // cuenta regresiva de la reserva. Al llegar a cero recarga: el servidor
+    // decide que hacer, la pantalla no se lo inventa.
+    var caja = document.querySelector('.pg-reloj');
+    if (caja) {
+        var quedan = parseInt(caja.dataset.segundos, 10) || 0;
+        var cifra = document.getElementById('pg-reloj');
+        var pintar = function () {
+            if (quedan <= 0) { window.location.reload(); return; }
+            var m = Math.floor(quedan / 60);
+            var s = quedan % 60;
+            cifra.textContent = m + ':' + (s < 10 ? '0' : '') + s;
+            cifra.classList.toggle('pg-apura', quedan <= 120);
+            quedan -= 1;
+        };
+        pintar();
+        setInterval(pintar, 1000);
+    }
+
+    // copiar numeros de cuenta y monto sin seleccionarlos a mano
+    document.querySelectorAll('.pg-copiar').forEach(function (boton) {
+        boton.addEventListener('click', function () {
+            var texto = boton.dataset.copiar;
+            var listo = function () {
+                var antes = boton.textContent;
+                boton.textContent = 'Copiado';
+                boton.classList.add('pg-copiado');
+                setTimeout(function () {
+                    boton.textContent = antes;
+                    boton.classList.remove('pg-copiado');
+                }, 1600);
+            };
+            if (navigator.clipboard) {
+                navigator.clipboard.writeText(texto).then(listo, function () {});
+            } else {
+                var campo = document.createElement('textarea');
+                campo.value = texto;
+                document.body.appendChild(campo);
+                campo.select();
+                try { document.execCommand('copy'); listo(); } catch (e) {}
+                document.body.removeChild(campo);
+            }
+        });
+    });
+})();
+</script>
+{% endblock %}

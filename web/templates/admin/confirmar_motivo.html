@@ -1,0 +1,35 @@
+{% extends "admin/base_site.html" %}
+
+{% comment %}
+Pantalla intermedia para las acciones que deshacen algo (anular una compra,
+cancelar un pedido). Exigen un motivo porque queda escrito en el kardex.
+{% endcomment %}
+
+{% block content %}
+<h1>{{ titulo }}</h1>
+
+<p>{{ explicacion }}</p>
+
+<ul>
+    {% for objeto in objetos %}
+        <li><b>{{ objeto }}</b></li>
+    {% endfor %}
+</ul>
+
+<form method="post">
+    {% csrf_token %}
+    {% for id in seleccionadas %}
+        <input type="hidden" name="_selected_action" value="{{ id }}">
+    {% endfor %}
+    <input type="hidden" name="action" value="{{ accion }}">
+
+    <p>{{ formulario.motivo.label_tag }}<br>{{ formulario.motivo }}</p>
+    {% for error in formulario.motivo.errors %}<p style="color:#b5541b">{{ error }}</p>{% endfor %}
+    <p style="color:#666;font-size:13px">{{ formulario.motivo.help_text }}</p>
+
+    <p>
+        <input type="submit" name="aplicar" value="{{ boton }}" class="default">
+        <a href="../" class="button" style="margin-left:8px">Volver</a>
+    </p>
+</form>
+{% endblock %}

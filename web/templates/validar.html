@@ -1,0 +1,66 @@
+{% load static %}<!doctype html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pagos por validar - GOAT X</title>
+    {% include 'includes/panel_estilos.html' %}
+</head>
+<body>
+
+<header class="vp-head">
+    <a class="vp-marca" href="{% url 'web:index' %}">GOAT X</a>
+    <span class="vp-titulo">Pagos por validar</span>
+    <span class="vp-cuenta {% if pendientes %}vp-hay{% endif %}">{{ pendientes|length }}</span>
+</header>
+
+<main class="vp-main">
+    {% if messages %}
+        {% for message in messages %}
+        <p class="vp-aviso {% if message.tags == 'error' %}vp-aviso-error{% endif %}">{{ message }}</p>
+        {% endfor %}
+    {% endif %}
+
+    {% if not pendientes %}
+        <div class="vp-vacio">
+            <p class="vp-vacio-check">&#10003;</p>
+            <p><b>No hay nada esperando.</b></p>
+            <p class="vp-vacio-sub">Cuando un cliente envie su comprobante aparece aca y te llega un correo.</p>
+        </div>
+    {% else %}
+        <p class="vp-nota">
+            Le prometimos al cliente confirmarle en {{ horas_promesa }} horas.
+            Antes de validar, mira tu cuenta: <b>el comprobante es evidencia, no prueba</b>.
+        </p>
+
+        <ul class="vp-lista">
+            {% for pago in pendientes %}
+            <li>
+                <a class="vp-item {% if pago.demorado %}vp-demorado{% endif %}"
+                   href="{% url 'web:validarPago' pago.id %}">
+                    <span class="vp-thumb">
+                        {% if pago.voucher %}
+                        <img src="{% url 'web:voucherPago' pago.id %}" alt="">
+                        {% endif %}
+                    </span>
+                    <span class="vp-datos">
+                        <b class="vp-pedido">{{ pago.pedido.nro_pedido }}</b>
+                        <span class="vp-cliente">{{ pago.pedido.nombre_comprador }} {{ pago.pedido.apellido_comprador }}</span>
+                        <span class="vp-meta">{{ pago.cuenta.etiqueta }} &middot; op. {{ pago.nro_operacion }}</span>
+                        {% if pago.fuera_de_plazo %}
+                        <span class="vp-tarde">Pago fuera de plazo</span>
+                        {% endif %}
+                    </span>
+                    <span class="vp-derecha">
+                        <b class="vp-monto">s/{{ pago.monto_declarado }}</b>
+                        <span class="vp-espera">{{ pago.espera }}</span>
+                    </span>
+                </a>
+            </li>
+            {% endfor %}
+        </ul>
+    {% endif %}
+</main>
+
+</body>
+</html>

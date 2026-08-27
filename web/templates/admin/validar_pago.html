@@ -1,0 +1,91 @@
+{% extends "admin/base_site.html" %}
+
+{% comment %}
+Pantalla de validacion. Muestra el comprobante al lado de los datos del pedido
+para que se pueda comparar sin ir y volver, y pide el monto que se vio en la
+cuenta: validar es contar, no aceptar.
+{% endcomment %}
+
+{% block content %}
+<h1>Validar comprobantes</h1>
+
+<p>
+    Antes de validar, abri tu banca por internet o la notificacion de Yape y confirma
+    que el dinero entro. <b>El comprobante es evidencia, no prueba</b>: una captura se
+    falsifica en segundos.
+</p>
+
+<form method="post">
+    {% csrf_token %}
+    {% for id in seleccionadas %}
+        <input type="hidden" name="_selected_action" value="{{ id }}">
+    {% endfor %}
+    <input type="hidden" name="action" value="{{ accion }}">
+
+    {% for pago in pagos %}
+    <div class="vp-pago">
+        <div class="vp-datos">
+            <h2>{{ pago.pedido.nro_pedido }}</h2>
+            <table>
+                <tr><th>Cliente</th><td>{{ pago.pedido.nombre_comprador }} {{ pago.pedido.apellido_comprador }}</td></tr>
+                <tr><th>Total del pedido</th><td><b>s/{{ pago.pedido.monto_total }}</b></td></tr>
+                <tr><th>Declara haber pagado</th><td>s/{{ pago.monto_declarado }}</td></tr>
+                <tr><th>N&deg; de operacion</th><td>{{ pago.nro_operacion }}</td></tr>
+                <tr><th>Cuenta</th><td>{{ pago.cuenta }}</td></tr>
+                <tr><th>Fecha del comprobante</th><td>{{ pago.fecha_pago|date:"d/m/Y" }}</td></tr>
+                <tr><th>Enviado</th><td>{{ pago.creado|date:"d/m/Y H:i" }}</td></tr>
+            </table>
+        </div>
+        <div class="vp-voucher">
+            {% if pago.voucher %}
+                <a href="{% url 'web:voucherPago' pago.id %}" target="_blank">
+                    <img src="{% url 'web:voucherPago' pago.id %}" alt="Comprobante de {{ pago.nro_operacion }}">
+                </a>
+            {% else %}
+                <p>Sin comprobante adjunto.</p>
+            {% endif %}
+        </div>
+    </div>
+    {% endfor %}
+
+    <div class="vp-confirmar">
+        <p>{{ formulario.monto_confirmado.label_tag }} {{ formulario.monto_confirmado }}</p>
+        {% for error in formulario.monto_confirmado.errors %}<p style="color:#b5541b">{{ error }}</p>{% endfor %}
+        <p style="color:#666;font-size:13px">{{ formulario.monto_confirmado.help_text }}</p>
+
+        <p>
+            <input type="submit" name="aplicar" value="Validar" class="default">
+            <a href="../" class="button" style="margin-left:8px">Volver</a>
+        </p>
+    </div>
+</form>
+
+<style>
+    .vp-pago {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 320px;
+        gap: 24px;
+        align-items: start;
+        padding: 18px 0;
+        border-bottom: 1px solid #e0e0e0;
+    }
+    .vp-datos h2 { margin: 0 0 10px; font-size: 17px; }
+    .vp-datos table { border-collapse: collapse; }
+    .vp-datos th {
+        text-align: left; font-weight: 400; color: #666;
+        padding: 4px 16px 4px 0; white-space: nowrap;
+    }
+    .vp-datos td { padding: 4px 0; }
+    .vp-voucher img {
+        width: 100%; height: auto;
+        border: 1px solid #ddd; border-radius: 4px;
+    }
+    .vp-confirmar { margin-top: 22px; }
+    .vp-confirmar input[type="number"] { padding: 6px 8px; font-size: 15px; }
+
+    @media (max-width: 800px) {
+        .vp-pago { grid-template-columns: 1fr; }
+        .vp-voucher { max-width: 320px; }
+    }
+</style>
+{% endblock %}

@@ -86,15 +86,15 @@ class Cart:
         en_carrito = self.cart.get(clave, {}).get('cantidad', 0)
         nueva_cantidad = en_carrito + cantidad
 
-        if nueva_cantidad > item.stock:
+        if nueva_cantidad > item.disponible:
             nombre = self._nombrar(item)
-            if item.stock == 0:
+            if item.disponible == 0:
                 raise ValueError(f'{nombre.capitalize()}: sin stock')
 
-            disponible = item.stock - en_carrito
+            disponible = item.disponible - en_carrito
             if disponible <= 0:
                 raise ValueError(
-                    f'Ya tienes en tu carrito {self._unidades(item.stock)} '
+                    f'Ya tienes en tu carrito {self._unidades(item.disponible)} '
                     f'de {nombre}, que es todo el stock disponible'
                 )
             raise ValueError(f'Solo quedan {self._unidades(disponible)} mas de {nombre}')
@@ -126,9 +126,9 @@ class Cart:
             del self.cart[clave]
             self.save()
             return
-        if cantidad > item.stock:
+        if cantidad > item.disponible:
             raise ValueError(
-                f'Solo quedan {self._unidades(item.stock)} de {self._nombrar(item)}'
+                f'Solo quedan {self._unidades(item.disponible)} de {self._nombrar(item)}'
             )
         precio = Decimal(self.cart[clave]['precio'])
         self.cart[clave]['cantidad'] = cantidad

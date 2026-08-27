@@ -1,19 +1,32 @@
+import os
+import shutil
+import tempfile
 from datetime import timedelta
 from decimal import Decimal
+from io import BytesIO, StringIO
 
+from django.conf import settings
 from django.contrib.auth.models import User
+from django.core import mail
 from django.core.exceptions import ValidationError
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.management import call_command
+from django.db import transaction
 from django.db.models import RestrictedError
 from django.db.utils import IntegrityError
-from django.test import TestCase
+from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
+from . import disponibilidad
+from .disponibilidad import para_carrito, para_item
 from .models import (
     Categoria,
     Cliente,
     Color,
+    CuentaRecaudadora,
     Compra,
+    CompraBloqueada,
     CompraDetalle,
     Cupon,
     Pedido,
@@ -24,6 +37,12 @@ from .models import (
     Atributo,
     Curva,
     Inventario,
+    MovimientoInventario,
+    Pago,
+    PuntoRecojo,
+    Traslado,
+    TrasladoDetalle,
+    Ubicacion,
 )
 
 
@@ -43,6 +62,40 @@ def _valor_talla(valor, orden):
 
 def _categoria_calzado(nombre='Calzado'):
     return Categoria.objects.create(nombre=nombre, atributo=_atributo_talla())
+
+
+# dos carpetas distintas a proposito: los tests comprueban que el voucher NO
+# cae bajo MEDIA_ROOT, y con una sola no se podria distinguir
+MEDIA_TEMPORAL = tempfile.mkdtemp()
+PRIVADO_TEMPORAL = tempfile.mkdtemp()
+
+ARCHIVOS_APARTE = override_settings(
+    MEDIA_ROOT=MEDIA_TEMPORAL, PRIVADO_ROOT=PRIVADO_TEMPORAL
+)
+
+
+def tearDownModule():
+    shutil.rmtree(MEDIA_TEMPORAL, ignore_errors=True)
+    shutil.rmtree(PRIVADO_TEMPORAL, ignore_errors=True)
+
+
+def _imagen(nombre='voucher.png', tamano=(40, 40)):
+    """ Una imagen valida y minuscula, para no ensuciar los tests con archivos """
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new('RGB', tamano, '#DDDDDD').save(buffer, 'PNG')
+    return SimpleUploadedFile(nombre, buffer.getvalue(), content_type='image/png')
+
+
+def _imagen_pesada():
+    """ Ruido puro: el PNG no lo puede comprimir, asi que pasa el megabyte """
+    from PIL import Image
+
+    img = Image.frombytes('RGB', (900, 900), os.urandom(900 * 900 * 3))
+    buffer = BytesIO()
+    img.save(buffer, 'PNG')
+    return SimpleUploadedFile('grande.png', buffer.getvalue(), content_type='image/png')
 
 
 class CategoriaModelTests(TestCase):
@@ -153,6 +206,7 @@ class CompraModelTests(TestCase):
 
 
 DATOS_CHECKOUT = {
+    'modo_entrega': 'E',
     'nombre': 'Deybis',
     'apellidos': 'Ccanto',
     'email': 'cliente@ejemplo.com',
@@ -208,12 +262,14 @@ class CheckoutTests(TestCase):
         self.assertEqual(pedido.email_comprador, 'cliente@ejemplo.com')
         self.assertEqual(pedido.monto_total, Decimal('858.00'))
 
-    def test_la_venta_descuenta_el_stock(self):
+    def test_confirmar_reserva_pero_no_descuenta(self):
         self._agregar(self.t40, 2)
         self._confirmar()
 
         self.t40.refresh_from_db()
-        self.assertEqual(self.t40.stock, 1)
+        self.assertEqual(self.t40.stock, 3)        # los pares siguen en el estante
+        self.assertEqual(self.t40.reservado, 2)    # pero ya no se ofrecen
+        self.assertEqual(self.t40.disponible, 1)
 
     def test_el_detalle_guarda_copia_del_producto(self):
         self._agregar(self.t40, 2)
@@ -256,8 +312,8 @@ class CheckoutTests(TestCase):
         self.assertEqual(pedido.monto_total, Decimal('1287.00'))
         self.t40.refresh_from_db()
         self.t41.refresh_from_db()
-        self.assertEqual(self.t40.stock, 1)
-        self.assertEqual(self.t41.stock, 0)
+        self.assertEqual(self.t40.disponible, 1)
+        self.assertEqual(self.t41.disponible, 0)
 
     # --- cliente registrado ---
 
@@ -691,7 +747,7 @@ class CarritoSinAtributoTests(TestCase):
         self.assertEqual(pedido.monto_total, Decimal('498.00'))
         self.assertEqual(pedido.detalles.get().valor, '')
         self.item.refresh_from_db()
-        self.assertEqual(self.item.stock, 1)
+        self.assertEqual(self.item.disponible, 1)
 
     def test_la_ficha_no_muestra_selector(self):
         respuesta = self.client.get(reverse('web:producto', args=['LIC900']))
@@ -903,7 +959,7 @@ class CarritoDeVersionAnteriorTests(TestCase):
         pedido = Pedido.objects.get()
         self.assertEqual(pedido.detalles.get().valor, '42')
         self.item.refresh_from_db()
-        self.assertEqual(self.item.stock, 2)
+        self.assertEqual(self.item.disponible, 2)
 
     def test_lineas_irreconocibles_se_descartan_sin_romper(self):
         self._guardar_carrito({
@@ -1015,4 +1071,2143 @@ class PaletaDeColoresTests(TestCase):
 
         self.assertEqual(Pedido.objects.count(), 1)
         item.refresh_from_db()
-        self.assertEqual(item.stock, 1)
+        self.assertEqual(item.disponible, 1)
+
+
+# --- Fase 6: integridad del ciclo compra -> venta -------------------------
+
+
+class _AlmacenMixin:
+    """ Un producto con dos tallas y un proveedor: el punto de partida de todo """
+
+    def _montar_almacen(self):
+        categoria = _categoria_calzado()
+        producto = Producto.objects.create(categoria=categoria, nombre='Adidas Campus 00s')
+        self.variante = Variante.objects.create(
+            producto=producto, sku='JP9163', color=_color('Negro'), precio_venta=Decimal('429.00')
+        )
+        self.t40 = Inventario.objects.create(variante=self.variante, valor=_valor_talla('40', 1))
+        self.t41 = Inventario.objects.create(variante=self.variante, valor=_valor_talla('41', 2))
+        self.proveedor = Proveedor.objects.create(razon_social='Importaciones SAC', ruc='20123456789')
+
+    def _compra(self, nro_documento, lineas, aplicar=False):
+        compra = Compra.objects.create(
+            proveedor=self.proveedor, nro_documento=nro_documento, fecha_compra='2026-08-26'
+        )
+        for item, cantidad, costo in lineas:
+            CompraDetalle.objects.create(
+                compra=compra, item=item, cantidad=cantidad, costo_unitario=costo
+            )
+        if aplicar:
+            compra.aplicar_a_inventario()
+        return compra
+
+
+class _VentaMixin:
+    """ Arma pedidos reales pasando por el carrito y el checkout de invitado """
+
+    def _agregar(self, item, cantidad=1):
+        return self.client.post(reverse('web:agregarCarrito'), {
+            'item_id': item.id, 'cantidad': cantidad, 'sku': item.variante.sku,
+        })
+
+    # el ciclo completo, en orden. Un pedido no salta pasos.
+    CICLO = (Pedido.EN_VALIDACION, Pedido.PAGADO, Pedido.ENVIADO, Pedido.ENTREGADO)
+
+    def _comprar(self):
+        self.client.get(reverse('web:continuarComoInvitado'))
+        self.client.post(reverse('web:registrarPedido'), DATOS_CHECKOUT, follow=True)
+        return Pedido.objects.latest('id')
+
+    def _pagar(self, pedido, nro='OP-PRUEBA'):
+        """ Declara y valida el pago. Recien aca la reserva se vuelve venta. """
+        cuenta = CuentaRecaudadora.objects.filter(activo=True).first()
+        pago = pedido.declarar_pago(
+            cuenta=cuenta,
+            monto_declarado=pedido.monto_total,
+            nro_operacion=nro,
+            voucher=_imagen(),
+            fecha_pago=timezone.localdate(),
+        )
+        return pago.validar(pedido.monto_total)
+
+    def _avanzar(self, pedido, hasta):
+        """ Camina el ciclo hasta el estado pedido, sin saltarse ninguno """
+        for destino in self.CICLO:
+            pedido.cambiar_estado(destino)
+            if destino == hasta:
+                break
+        return pedido
+
+
+@ARCHIVOS_APARTE
+class KardexTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """ Cada unidad que entra o sale deja una linea que explica de donde salio """
+
+    def setUp(self):
+        self._montar_almacen()
+
+    def test_aplicar_una_compra_deja_su_movimiento(self):
+        self._compra('B001-1', [(self.t40, 3, Decimal('300.00'))], aplicar=True)
+
+        movimiento = self.t40.movimientos.get()
+        self.assertEqual(movimiento.tipo, MovimientoInventario.COMPRA)
+        self.assertEqual(movimiento.cantidad, 3)
+        self.assertEqual(movimiento.stock_anterior, 0)
+        self.assertEqual(movimiento.stock_resultante, 3)
+        self.assertEqual(movimiento.costo_unitario, Decimal('300.00'))
+
+    def test_el_movimiento_apunta_al_documento_que_lo_respalda(self):
+        compra = self._compra('B001-2', [(self.t40, 3, Decimal('300.00'))], aplicar=True)
+
+        movimiento = self.t40.movimientos.get()
+        self.assertEqual(movimiento.compra, compra)
+        self.assertIn('B001-2', movimiento.documento)
+
+    def test_reservar_no_escribe_en_el_kardex(self):
+        self._compra('B001-2b', [(self.t40, 3, Decimal('300.00'))], aplicar=True)
+        self._agregar(self.t40, 2)
+        pedido = self._comprar()
+
+        # el par sigue en el estante: no hubo movimiento que registrar
+        self.assertFalse(pedido.movimientos.exists())
+        self.assertEqual(self.t40.movimientos.count(), 1)     # solo la compra
+
+    def test_la_venta_aparece_recien_al_validar_el_pago(self):
+        self._compra('B001-3', [(self.t40, 3, Decimal('300.00'))], aplicar=True)
+        self._agregar(self.t40, 2)
+        pedido = self._comprar()
+
+        self.assertFalse(self.t40.movimientos.filter(tipo=MovimientoInventario.VENTA).exists())
+        self._pagar(pedido)
+
+        salida = self.t40.movimientos.get(tipo=MovimientoInventario.VENTA)
+        self.assertEqual(salida.cantidad, -2)
+        self.assertEqual(salida.stock_resultante, 1)
+        self.assertEqual(salida.pedido, pedido)
+
+    def test_el_kardex_se_lee_de_corrido(self):
+        self._compra('B001-4', [(self.t40, 3, Decimal('300.00'))], aplicar=True)
+        self._compra('B001-5', [(self.t40, 2, Decimal('320.00'))], aplicar=True)
+        self._agregar(self.t40, 4)
+        self._pagar(self._comprar())
+
+        saldos = list(self.t40.movimientos.order_by('id').values_list('cantidad', 'stock_resultante'))
+        self.assertEqual(saldos, [(3, 3), (2, 5), (-4, 1)])
+
+    def test_el_stock_cuadra_con_la_suma_del_kardex(self):
+        self._compra('B001-6', [(self.t40, 5, Decimal('300.00'))], aplicar=True)
+        self._agregar(self.t40, 2)
+        self._pagar(self._comprar())
+
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.stock, 3)
+        self.assertEqual(self.t40.stock_segun_kardex, 3)
+
+    def test_la_venta_no_mueve_el_costo_promedio(self):
+        self._compra('B001-7', [(self.t40, 3, Decimal('300.00'))], aplicar=True)
+        self._compra('B001-8', [(self.t40, 2, Decimal('320.00'))], aplicar=True)
+        self._agregar(self.t40, 4)
+        self._pagar(self._comprar())
+
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.costo_promedio, Decimal('308.00'))
+
+    def test_un_movimiento_de_cero_unidades_se_rechaza(self):
+        with self.assertRaises(ValueError):
+            self.t40.registrar_movimiento(MovimientoInventario.AJUSTE, 0)
+
+    def test_no_se_puede_sacar_mas_de_lo_que_hay(self):
+        self._compra('B001-9', [(self.t40, 2, Decimal('300.00'))], aplicar=True)
+        with self.assertRaises(ValueError):
+            self.t40.descontar_stock(3)
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.stock, 2)
+
+
+class VerificarKardexTests(_AlmacenMixin, TestCase):
+    """ El comando que avisa si el saldo cacheado y el historial se separaron """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B002-1', [(self.t40, 5, Decimal('300.00'))], aplicar=True)
+
+    def _correr(self, *argumentos):
+        salida = StringIO()
+        call_command('verificar_kardex', *argumentos, stdout=salida)
+        return salida.getvalue()
+
+    def test_avisa_que_todo_cuadra(self):
+        self.assertIn('cuadra con el stock', self._correr())
+
+    def test_detecta_un_stock_movido_por_fuera(self):
+        # un UPDATE directo saltea registrar_movimiento(), que es justo el caso
+        # que el comando existe para encontrar
+        Inventario.objects.filter(pk=self.t40.pk).update(stock=9)
+
+        salida = self._correr()
+        self.assertIn('stock 9, kardex 5', salida)
+        self.assertIn('no cuadran', salida)
+
+    def test_arreglar_registra_la_diferencia_sin_tocar_el_stock(self):
+        Inventario.objects.filter(pk=self.t40.pk).update(stock=9)
+        self._correr('--arreglar')
+
+        self.t40.refresh_from_db()
+        ajuste = self.t40.movimientos.get(tipo=MovimientoInventario.AJUSTE)
+        self.assertEqual(ajuste.cantidad, 4)
+        self.assertEqual(self.t40.stock, 9)
+        self.assertEqual(self.t40.stock_segun_kardex, 9)
+        self.assertIn('cuadra con el stock', self._correr())
+
+
+class CompraAplicadaTests(_AlmacenMixin, TestCase):
+    """
+    Huecos 1 y 2 de la fase: una boleta que ya sumo stock no se edita ni se borra.
+    Antes se podia, y el almacen quedaba diciendo algo distinto a la factura.
+    """
+
+    def setUp(self):
+        self._montar_almacen()
+
+    def test_editar_una_linea_ya_aplicada_se_rechaza(self):
+        compra = self._compra('B003-1', [(self.t40, 3, Decimal('300.00'))], aplicar=True)
+
+        detalle = compra.detalles.get()
+        detalle.cantidad = 99
+        with self.assertRaises(CompraBloqueada):
+            detalle.save()
+
+        detalle.refresh_from_db()
+        self.t40.refresh_from_db()
+        self.assertEqual(detalle.cantidad, 3)
+        self.assertEqual(self.t40.stock, 3)
+
+    def test_borrar_una_linea_ya_aplicada_se_rechaza(self):
+        compra = self._compra('B003-2', [(self.t40, 3, Decimal('300.00'))], aplicar=True)
+
+        with self.assertRaises(CompraBloqueada):
+            compra.detalles.get().delete()
+        self.assertEqual(compra.detalles.count(), 1)
+
+    def test_agregar_una_linea_a_una_compra_aplicada_se_rechaza(self):
+        compra = self._compra('B003-3', [(self.t40, 3, Decimal('300.00'))], aplicar=True)
+
+        with self.assertRaises(CompraBloqueada):
+            CompraDetalle.objects.create(
+                compra=compra, item=self.t41, cantidad=2, costo_unitario=Decimal('310.00')
+            )
+        self.t41.refresh_from_db()
+        self.assertEqual(self.t41.stock, 0)
+
+    def test_borrar_una_compra_aplicada_se_rechaza(self):
+        compra = self._compra('B003-4', [(self.t40, 5, Decimal('300.00'))], aplicar=True)
+
+        with self.assertRaises(CompraBloqueada):
+            compra.delete()
+
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.stock, 5)
+        self.assertTrue(Compra.objects.filter(pk=compra.pk).exists())
+
+    def test_una_compra_en_borrador_si_se_corrige(self):
+        compra = self._compra('B003-5', [(self.t40, 3, Decimal('300.00'))])
+
+        detalle = compra.detalles.get()
+        detalle.cantidad = 4
+        detalle.save()
+
+        compra.aplicar_a_inventario()
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.stock, 4)
+
+    def test_una_compra_en_borrador_si_se_borra(self):
+        compra = self._compra('B003-6', [(self.t40, 3, Decimal('300.00'))])
+        compra.detalles.get().delete()
+        compra.delete()
+        self.assertFalse(Compra.objects.filter(pk=compra.pk).exists())
+
+
+class AnularCompraTests(_AlmacenMixin, TestCase):
+    """ La salida correcta cuando una boleta se registro mal """
+
+    def setUp(self):
+        self._montar_almacen()
+
+    def test_anular_devuelve_el_stock(self):
+        compra = self._compra('B004-1', [(self.t40, 5, Decimal('300.00'))], aplicar=True)
+        compra.anular('Llegaron 5 pares menos de los facturados')
+
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.stock, 0)
+        self.assertEqual(self.t40.stock_segun_kardex, 0)
+
+    def test_anular_devuelve_el_costo_promedio_a_donde_estaba(self):
+        self._compra('B004-2', [(self.t40, 3, Decimal('300.00'))], aplicar=True)
+        cara = self._compra('B004-3', [(self.t40, 2, Decimal('500.00'))], aplicar=True)
+
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.costo_promedio, Decimal('380.00'))
+
+        cara.anular('El proveedor facturo el costo equivocado')
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.stock, 3)
+        self.assertEqual(self.t40.costo_promedio, Decimal('300.00'))
+
+    def test_la_boleta_anulada_sigue_existiendo_con_su_motivo(self):
+        compra = self._compra('B004-4', [(self.t40, 5, Decimal('300.00'))], aplicar=True)
+        compra.anular('Se registro dos veces la misma factura')
+
+        compra.refresh_from_db()
+        self.assertTrue(compra.anulado)
+        self.assertEqual(compra.estado, 'Anulada')
+        self.assertIsNotNone(compra.fecha_anulacion)
+        self.assertIn('dos veces', compra.motivo_anulacion)
+        self.assertEqual(compra.detalles.count(), 1)
+
+    def test_el_kardex_conserva_la_entrada_y_la_salida(self):
+        compra = self._compra('B004-5', [(self.t40, 5, Decimal('300.00'))], aplicar=True)
+        compra.anular('Boleta equivocada')
+
+        movimientos = list(self.t40.movimientos.order_by('id').values_list('tipo', 'cantidad'))
+        self.assertEqual(movimientos, [
+            (MovimientoInventario.COMPRA, 5),
+            (MovimientoInventario.ANULA_COMPRA, -5),
+        ])
+
+    def test_no_se_anula_si_las_unidades_ya_se_vendieron(self):
+        compra = self._compra('B004-6', [(self.t40, 3, Decimal('300.00'))], aplicar=True)
+        self.t40.descontar_stock(2)
+
+        with self.assertRaises(ValueError):
+            compra.anular('Boleta equivocada')
+
+        compra.refresh_from_db()
+        self.t40.refresh_from_db()
+        self.assertFalse(compra.anulado)
+        self.assertEqual(self.t40.stock, 1)
+
+    def test_una_boleta_de_varias_lineas_no_se_anula_a_medias(self):
+        compra = self._compra(
+            'B004-7',
+            [(self.t40, 3, Decimal('300.00')), (self.t41, 2, Decimal('310.00'))],
+            aplicar=True,
+        )
+        self.t41.descontar_stock(2)      # la segunda linea ya no se puede devolver
+
+        with self.assertRaises(ValueError):
+            compra.anular('Boleta equivocada')
+
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.stock, 3)
+
+    def test_anular_exige_un_motivo(self):
+        compra = self._compra('B004-8', [(self.t40, 3, Decimal('300.00'))], aplicar=True)
+        with self.assertRaises(ValueError):
+            compra.anular('   ')
+
+    def test_no_se_anula_dos_veces(self):
+        compra = self._compra('B004-9', [(self.t40, 3, Decimal('300.00'))], aplicar=True)
+        compra.anular('Boleta equivocada')
+
+        with self.assertRaises(ValueError):
+            compra.anular('Otra vez')
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.stock, 0)
+
+    def test_una_compra_en_borrador_se_borra_no_se_anula(self):
+        compra = self._compra('B004-10', [(self.t40, 3, Decimal('300.00'))])
+        with self.assertRaises(ValueError):
+            compra.anular('Todavia no toco nada')
+
+    def test_una_compra_anulada_no_se_vuelve_a_aplicar(self):
+        compra = self._compra('B004-11', [(self.t40, 3, Decimal('300.00'))], aplicar=True)
+        compra.anular('Boleta equivocada')
+
+        with self.assertRaises(ValueError):
+            compra.aplicar_a_inventario()
+
+
+class EstadosPedidoTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """ El pedido avanza por su ciclo: no salta pasos ni retrocede """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B005-1', [(self.t40, 10, Decimal('300.00'))], aplicar=True)
+        self._agregar(self.t40, 2)
+        self.pedido = self._comprar()
+
+    def test_nace_solicitado(self):
+        self.assertEqual(self.pedido.estado, Pedido.SOLICITADO)
+
+    def test_recorre_el_ciclo_completo(self):
+        self._avanzar(self.pedido, Pedido.ENTREGADO)
+        self.pedido.refresh_from_db()
+        self.assertEqual(self.pedido.estado, Pedido.ENTREGADO)
+
+    def test_no_salta_de_solicitado_a_entregado(self):
+        with self.assertRaises(ValueError):
+            self.pedido.cambiar_estado(Pedido.ENTREGADO)
+        self.pedido.refresh_from_db()
+        self.assertEqual(self.pedido.estado, Pedido.SOLICITADO)
+
+    def test_no_retrocede(self):
+        self._avanzar(self.pedido, Pedido.PAGADO)
+        with self.assertRaises(ValueError):
+            self.pedido.cambiar_estado(Pedido.SOLICITADO)
+
+    def test_no_pasa_a_pagado_sin_pasar_por_validacion(self):
+        with self.assertRaises(ValueError):
+            self.pedido.cambiar_estado(Pedido.PAGADO)
+        self.pedido.refresh_from_db()
+        self.assertEqual(self.pedido.estado, Pedido.SOLICITADO)
+
+    def test_un_pedido_entregado_ya_no_se_mueve(self):
+        self._avanzar(self.pedido, Pedido.ENTREGADO)
+        self.assertEqual(self.pedido.estados_siguientes, [])
+        self.assertFalse(self.pedido.cancelable)
+
+
+@ARCHIVOS_APARTE
+class CancelarPedidoTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """ Hueco 3 de la fase: si el cliente se arrepiente, el stock vuelve """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B006-1', [(self.t40, 10, Decimal('300.00'))], aplicar=True)
+
+    def test_cancelar_sin_pagar_solo_suelta_la_reserva(self):
+        self._agregar(self.t40, 3)
+        pedido = self._comprar()
+
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.stock, 10)          # nunca salieron del estante
+        self.assertEqual(self.t40.disponible, 7)
+
+        pedido.cancelar('El cliente se arrepintio')
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.reservado, 0)
+        self.assertEqual(self.t40.disponible, 10)
+        # y el kardex no se entero de nada: no hubo movimiento que registrar
+        self.assertFalse(pedido.movimientos.exists())
+
+    def test_cancelar_ya_pagado_si_devuelve_el_stock(self):
+        self._agregar(self.t40, 3)
+        pedido = self._comprar()
+        self._pagar(pedido)
+
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.stock, 7)           # ahora si salieron
+
+        pedido.cancelar('Llego roto y lo devolvio')
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.stock, 10)
+        self.assertEqual(self.t40.stock_segun_kardex, 10)
+
+    def test_cancelar_no_altera_el_costo_promedio(self):
+        self._agregar(self.t40, 3)
+        pedido = self._comprar()
+        self._pagar(pedido)
+        pedido.cancelar('El cliente se arrepintio')
+
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.costo_promedio, Decimal('300.00'))
+
+    def test_el_pedido_cancelado_conserva_su_detalle(self):
+        self._agregar(self.t40, 2)
+        pedido = self._comprar()
+        pedido.cancelar('Direccion de envio inalcanzable')
+
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.CANCELADO)
+        self.assertIsNotNone(pedido.fecha_cancelacion)
+        self.assertIn('inalcanzable', pedido.motivo_cancelacion)
+        self.assertEqual(pedido.detalles.count(), 1)
+        self.assertEqual(pedido.detalles.get().cantidad, 2)
+
+    def test_el_kardex_explica_la_devolucion(self):
+        self._agregar(self.t40, 2)
+        pedido = self._comprar()
+        self._pagar(pedido)
+        pedido.cancelar('El cliente se arrepintio')
+
+        vuelta = self.t40.movimientos.get(tipo=MovimientoInventario.CANCELA_VENTA)
+        self.assertEqual(vuelta.cantidad, 2)
+        self.assertEqual(vuelta.pedido, pedido)
+        self.assertIn('arrepintio', vuelta.motivo)
+
+    def test_cancelar_libera_el_uso_del_cupon(self):
+        ahora = timezone.now()
+        Cupon.objects.create(
+            codigo='BIENVENIDA10', tipo='P', valor=Decimal('10.00'),
+            fecha_inicio=ahora - timedelta(days=1), fecha_fin=ahora + timedelta(days=1),
+        )
+        self._agregar(self.t40, 2)
+        self.client.post(reverse('web:aplicarCupon'), {'codigo': 'BIENVENIDA10'}, follow=True)
+        pedido = self._comprar()
+
+        cupon = Cupon.objects.get(codigo='BIENVENIDA10')
+        self.assertEqual(cupon.veces_usado, 1)
+
+        pedido.cancelar('El cliente se arrepintio')
+        cupon.refresh_from_db()
+        self.assertEqual(cupon.veces_usado, 0)
+
+    def test_cancelar_exige_un_motivo(self):
+        self._agregar(self.t40, 2)
+        pedido = self._comprar()
+
+        with self.assertRaises(ValueError):
+            pedido.cancelar('')
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.disponible, 8)
+
+    def test_no_se_cancela_dos_veces(self):
+        self._agregar(self.t40, 2)
+        pedido = self._comprar()
+        pedido.cancelar('El cliente se arrepintio')
+
+        with self.assertRaises(ValueError):
+            pedido.cancelar('Otra vez')
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.disponible, 10)
+
+    def test_un_pedido_entregado_no_se_cancela(self):
+        self._agregar(self.t40, 2)
+        pedido = self._comprar()
+        self._avanzar(pedido, Pedido.ENTREGADO)
+
+        with self.assertRaises(ValueError):
+            pedido.cancelar('Tarde')
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.stock, 8)
+
+    def test_un_pedido_pagado_si_se_cancela(self):
+        self._agregar(self.t40, 2)
+        pedido = self._comprar()
+        self._avanzar(pedido, Pedido.PAGADO)
+        pedido.cambiar_estado(Pedido.CANCELADO, motivo='Se cayo el pago')
+
+        pedido.refresh_from_db()
+        self.t40.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.CANCELADO)
+        self.assertEqual(self.t40.stock, 10)
+
+
+class AdminFase6Tests(_AlmacenMixin, _VentaMixin, TestCase):
+    """ Las mismas reglas, pero por donde las va a usar el dueno de la tienda """
+
+    def setUp(self):
+        self._montar_almacen()
+        self.client.force_login(
+            User.objects.create_superuser('jefe', 'jefe@goatx.pe', 'clave-de-prueba')
+        )
+
+    # --- kardex ---
+
+    def test_el_kardex_se_puede_leer(self):
+        self._compra('B007-1', [(self.t40, 4, Decimal('300.00'))], aplicar=True)
+
+        respuesta = self.client.get(reverse('admin:web_movimientoinventario_changelist'))
+        self.assertContains(respuesta, 'JP9163')
+        self.assertContains(respuesta, 'B007-1')
+
+    def test_el_kardex_no_se_escribe_a_mano(self):
+        respuesta = self.client.get(reverse('admin:web_movimientoinventario_add'))
+        self.assertEqual(respuesta.status_code, 403)
+
+    def test_el_inventario_enlaza_a_su_historial(self):
+        self._compra('B007-2', [(self.t40, 4, Decimal('300.00'))], aplicar=True)
+
+        respuesta = self.client.get(reverse('admin:web_inventario_changelist'))
+        self.assertContains(respuesta, 'ver historial')
+        # los totales de la pantalla siguen en pie (ya se perdieron una vez)
+        self.assertEqual(respuesta.context['total_unidades'], 4)
+
+    # --- compras ---
+
+    def test_una_compra_aplicada_se_muestra_congelada(self):
+        compra = self._compra('B007-3', [(self.t40, 4, Decimal('300.00'))], aplicar=True)
+
+        respuesta = self.client.get(reverse('admin:web_compra_change', args=[compra.pk]))
+        self.assertNotContains(respuesta, 'name="nro_documento"')
+        self.assertNotContains(respuesta, '-0-cantidad')
+
+    def test_una_compra_en_borrador_se_deja_editar(self):
+        compra = self._compra('B007-4', [(self.t40, 4, Decimal('300.00'))])
+
+        respuesta = self.client.get(reverse('admin:web_compra_change', args=[compra.pk]))
+        self.assertContains(respuesta, 'name="nro_documento"')
+        self.assertContains(respuesta, '-0-cantidad')
+
+    def test_una_compra_aplicada_no_se_borra(self):
+        compra = self._compra('B007-5', [(self.t40, 4, Decimal('300.00'))], aplicar=True)
+
+        respuesta = self.client.get(reverse('admin:web_compra_delete', args=[compra.pk]))
+        self.assertEqual(respuesta.status_code, 403)
+
+    def test_anular_pide_el_motivo_antes_de_mover_nada(self):
+        compra = self._compra('B007-6', [(self.t40, 4, Decimal('300.00'))], aplicar=True)
+
+        respuesta = self.client.post(reverse('admin:web_compra_changelist'), {
+            'action': 'anular_compra', '_selected_action': [compra.pk],
+        })
+        self.assertContains(respuesta, 'Anular compras')
+
+        compra.refresh_from_db()
+        self.t40.refresh_from_db()
+        self.assertFalse(compra.anulado)
+        self.assertEqual(self.t40.stock, 4)
+
+    def test_anular_desde_el_admin_devuelve_el_stock(self):
+        compra = self._compra('B007-7', [(self.t40, 4, Decimal('300.00'))], aplicar=True)
+
+        self.client.post(reverse('admin:web_compra_changelist'), {
+            'action': 'anular_compra', '_selected_action': [compra.pk],
+            'aplicar': 'Anular', 'motivo': 'La boleta se registro dos veces',
+        })
+
+        compra.refresh_from_db()
+        self.t40.refresh_from_db()
+        self.assertTrue(compra.anulado)
+        self.assertEqual(self.t40.stock, 0)
+        self.assertEqual(self.t40.stock_segun_kardex, 0)
+
+    def test_aplicar_desde_el_admin_deja_el_movimiento_firmado(self):
+        compra = self._compra('B007-8', [(self.t40, 4, Decimal('300.00'))])
+
+        self.client.post(reverse('admin:web_compra_changelist'), {
+            'action': 'aplicar_al_inventario', '_selected_action': [compra.pk],
+        })
+
+        movimiento = self.t40.movimientos.get()
+        self.assertEqual(movimiento.usuario.username, 'jefe')
+        self.assertEqual(movimiento.compra, compra)
+
+    # --- pedidos ---
+
+    def test_el_estado_del_pedido_no_se_edita_a_mano(self):
+        self._compra('B007-9', [(self.t40, 6, Decimal('300.00'))], aplicar=True)
+        self._agregar(self.t40, 2)
+        pedido = self._comprar()
+
+        respuesta = self.client.get(reverse('admin:web_pedido_change', args=[pedido.pk]))
+        self.assertNotContains(respuesta, 'name="estado"')
+
+    def test_un_pedido_no_se_borra(self):
+        self._compra('B007-10', [(self.t40, 6, Decimal('300.00'))], aplicar=True)
+        self._agregar(self.t40, 2)
+        pedido = self._comprar()
+
+        respuesta = self.client.get(reverse('admin:web_pedido_delete', args=[pedido.pk]))
+        self.assertEqual(respuesta.status_code, 403)
+
+    def test_marcar_enviado_desde_el_admin(self):
+        self._compra('B007-11', [(self.t40, 6, Decimal('300.00'))], aplicar=True)
+        self._agregar(self.t40, 2)
+        pedido = self._comprar()
+        self._avanzar(pedido, Pedido.PAGADO)
+
+        self.client.post(reverse('admin:web_pedido_changelist'), {
+            'action': 'marcar_enviado', '_selected_action': [pedido.pk],
+        })
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.ENVIADO)
+
+    def test_cancelar_desde_el_admin_devuelve_el_stock(self):
+        self._compra('B007-12', [(self.t40, 6, Decimal('300.00'))], aplicar=True)
+        self._agregar(self.t40, 2)
+        pedido = self._comprar()
+
+        self.client.post(reverse('admin:web_pedido_changelist'), {
+            'action': 'cancelar_pedido', '_selected_action': [pedido.pk],
+            'aplicar': 'Cancelar pedidos', 'motivo': 'El cliente se arrepintio',
+        })
+
+        pedido.refresh_from_db()
+        self.t40.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.CANCELADO)
+        self.assertEqual(self.t40.stock, 6)
+
+
+# --- Fase 7: cobro por transferencia -------------------------------------
+
+def _cuenta_bcp():
+    return CuentaRecaudadora.objects.create(
+        metodo=CuentaRecaudadora.BANCO, titular='Monetix Retail',
+        banco='BCP', tipo_cuenta='CORRIENTE', numero='3507296754036',
+    )
+
+
+def _cuenta_yape():
+    return CuentaRecaudadora.objects.create(
+        metodo=CuentaRecaudadora.YAPE, titular='Monetix Retail', telefono='955134139',
+    )
+
+
+class CuentaRecaudadoraTests(TestCase):
+    """ Cada metodo de cobro pide sus propios datos """
+
+    def test_una_cuenta_bancaria_sin_numero_se_rechaza(self):
+        cuenta = CuentaRecaudadora(
+            metodo=CuentaRecaudadora.BANCO, titular='Monetix Retail',
+            banco='BCP', tipo_cuenta='CORRIENTE',
+        )
+        with self.assertRaises(ValidationError):
+            cuenta.full_clean()
+
+    def test_yape_sin_telefono_se_rechaza(self):
+        cuenta = CuentaRecaudadora(metodo=CuentaRecaudadora.YAPE, titular='Monetix Retail')
+        with self.assertRaises(ValidationError):
+            cuenta.full_clean()
+
+    def test_un_qr_sin_imagen_se_rechaza(self):
+        cuenta = CuentaRecaudadora(metodo=CuentaRecaudadora.QR, titular='Monetix Retail')
+        with self.assertRaises(ValidationError):
+            cuenta.full_clean()
+
+    def test_la_etiqueta_dice_lo_justo(self):
+        self.assertEqual(_cuenta_bcp().etiqueta, 'BCP · Corriente')
+        self.assertEqual(_cuenta_yape().etiqueta, 'Yape')
+
+
+@ARCHIVOS_APARTE
+class PagoTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """ El comprobante es una declaracion hasta que alguien lo confirma """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B008-1', [(self.t40, 10, Decimal('300.00'))], aplicar=True)
+        self.cuenta = _cuenta_bcp()
+        self._agregar(self.t40, 1)
+        self.pedido = self._comprar()
+
+    def _declarar(self, nro='OP-0001', monto=None, cuenta=None):
+        return self.pedido.declarar_pago(
+            cuenta=cuenta or self.cuenta,
+            monto_declarado=monto if monto is not None else self.pedido.monto_total,
+            nro_operacion=nro,
+            voucher=_imagen(),
+            fecha_pago=timezone.localdate(),
+        )
+
+    def test_declarar_un_pago_pone_el_pedido_en_validacion(self):
+        self.assertEqual(self.pedido.estado, Pedido.SOLICITADO)
+        self._declarar()
+
+        self.pedido.refresh_from_db()
+        self.assertEqual(self.pedido.estado, Pedido.EN_VALIDACION)
+
+    def test_declarar_no_da_nada_por_cobrado(self):
+        pago = self._declarar()
+        self.assertEqual(pago.estado, Pago.PENDIENTE)
+        self.assertIsNone(pago.monto_confirmado)
+        self.assertIsNone(pago.diferencia)
+
+    def test_validar_mueve_el_pedido_a_pagado(self):
+        pago = self._declarar()
+        pago.validar(self.pedido.monto_total)
+
+        self.pedido.refresh_from_db()
+        self.assertEqual(pago.estado, Pago.VALIDADO)
+        self.assertEqual(self.pedido.estado, Pedido.PAGADO)
+        self.assertTrue(pago.cuadra)
+
+    def test_validar_exige_el_monto_que_se_vio(self):
+        pago = self._declarar()
+        with self.assertRaises(ValueError):
+            pago.validar(None)
+
+        self.pedido.refresh_from_db()
+        self.assertEqual(self.pedido.estado, Pedido.EN_VALIDACION)
+
+    def test_validar_registra_la_diferencia(self):
+        pago = self._declarar(monto=Decimal('429.00'))
+        pago.validar(Decimal('420.00'))          # entro menos de lo que decia el pedido
+
+        self.assertEqual(pago.diferencia, Decimal('420.00') - self.pedido.monto_total)
+        self.assertFalse(pago.cuadra)
+
+    def test_rechazar_deja_el_pedido_esperando(self):
+        pago = self._declarar()
+        pago.rechazar('La captura esta borrosa, no se lee el monto')
+
+        self.pedido.refresh_from_db()
+        self.assertEqual(pago.estado, Pago.RECHAZADO)
+        self.assertEqual(self.pedido.estado, Pedido.EN_VALIDACION)
+        self.assertIn('borrosa', self.pedido.ultimo_rechazo.motivo_rechazo)
+
+    def test_rechazar_exige_un_motivo(self):
+        pago = self._declarar()
+        with self.assertRaises(ValueError):
+            pago.rechazar('   ')
+
+    def test_un_pago_validado_ya_no_se_rechaza(self):
+        pago = self._declarar()
+        pago.validar(self.pedido.monto_total)
+        with self.assertRaises(ValueError):
+            pago.rechazar('Me arrepenti')
+
+    def test_tras_un_rechazo_se_puede_declarar_otro(self):
+        primero = self._declarar('OP-0001')
+        primero.rechazar('Captura ilegible')
+
+        segundo = self._declarar('OP-0002')
+        self.pedido.refresh_from_db()
+        self.assertEqual(self.pedido.pago_pendiente, segundo)
+        self.assertEqual(self.pedido.pagos.count(), 2)
+
+    def test_el_mismo_comprobante_no_se_usa_dos_veces(self):
+        self._declarar('OP-0001')
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                self._declarar('OP-0001')
+
+    def test_el_mismo_numero_en_otra_cuenta_si_pasa(self):
+        self._declarar('OP-0001')
+        self._declarar('OP-0001', cuenta=_cuenta_yape())
+        self.assertEqual(self.pedido.pagos.count(), 2)
+
+    def test_un_pedido_cancelado_admite_comprobantes_pero_marcados(self):
+        """
+        Si ya transfirio, lo peor que puede hacer el sistema es no dejarlo avisar.
+        Se acepta el comprobante, marcado, para que alguien lo mire.
+        """
+        self.pedido.cancelar('El cliente se arrepintio')
+
+        pago = self._declarar()
+        self.assertTrue(pago.fuera_de_plazo)
+        self.pedido.refresh_from_db()
+        self.assertEqual(self.pedido.estado, Pedido.CANCELADO)
+
+    def test_un_pedido_despachado_no_admite_comprobantes(self):
+        self._pagar(self.pedido, nro='OP-YA')
+        self.pedido.refresh_from_db()
+        self.pedido.cambiar_estado(Pedido.ENVIADO)
+        with self.assertRaises(ValueError):
+            self._declarar(nro='OP-TARDE')
+
+
+@ARCHIVOS_APARTE
+class CheckoutPagoTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """ El paso de pago tal como lo recorre el cliente """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B009-1', [(self.t40, 10, Decimal('300.00'))], aplicar=True)
+        self.cuenta = _cuenta_bcp()
+
+    def _formulario(self, **cambios):
+        datos = {
+            'cuenta': self.cuenta.id,
+            'monto_declarado': '429.00',
+            'nro_operacion': 'OP-7788',
+            'fecha_pago': timezone.localdate().isoformat(),
+            'voucher': _imagen(),
+        }
+        datos.update(cambios)
+        return datos
+
+    def test_confirmar_el_pedido_lleva_a_la_pantalla_de_pago(self):
+        self._agregar(self.t40, 1)
+        self.client.get(reverse('web:continuarComoInvitado'))
+        respuesta = self.client.post(reverse('web:registrarPedido'), DATOS_CHECKOUT)
+        self.assertRedirects(respuesta, reverse('web:pagoPedido'))
+
+    def test_la_pantalla_muestra_las_cuentas_activas(self):
+        self._agregar(self.t40, 1)
+        self._comprar()
+
+        respuesta = self.client.get(reverse('web:pagoPedido'))
+        self.assertContains(respuesta, '3507296754036')
+        self.assertContains(respuesta, 'Monetix Retail')
+
+    def test_solo_se_ofrecen_las_cuentas_activas(self):
+        # la migracion 0017 siembra cuentas, asi que se apagan todas y queda una
+        CuentaRecaudadora.objects.update(activo=False)
+        CuentaRecaudadora.objects.create(
+            metodo=CuentaRecaudadora.BANCO, titular='Monetix Retail',
+            banco='Interbank', tipo_cuenta='AHORROS', numero='8881112223334',
+        )
+        self._agregar(self.t40, 1)
+        self._comprar()
+
+        respuesta = self.client.get(reverse('web:pagoPedido'))
+        self.assertContains(respuesta, '8881112223334')
+        self.assertNotContains(respuesta, '3507296754036')
+
+    def test_sin_pedido_en_sesion_no_hay_pantalla_de_pago(self):
+        respuesta = self.client.get(reverse('web:pagoPedido'))
+        self.assertRedirects(respuesta, reverse('web:index'))
+
+    def test_subir_el_comprobante_deja_el_pedido_en_validacion(self):
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+
+        respuesta = self.client.post(reverse('web:pagoPedido'), self._formulario())
+        self.assertRedirects(respuesta, reverse('web:gracias'))
+
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.EN_VALIDACION)
+        self.assertEqual(pedido.pagos.get().nro_operacion, 'OP-7788')
+
+    def test_un_comprobante_de_mas_de_un_mega_se_rechaza(self):
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+
+        respuesta = self.client.post(
+            reverse('web:pagoPedido'), self._formulario(voucher=_imagen_pesada())
+        )
+        self.assertEqual(respuesta.status_code, 200)
+        self.assertContains(respuesta, 'El maximo es 1 MB')
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.SOLICITADO)
+
+    def test_un_numero_de_operacion_repetido_se_avisa(self):
+        self._agregar(self.t40, 1)
+        self._comprar()
+        self.client.post(reverse('web:pagoPedido'), self._formulario())
+
+        # otro pedido intentando declarar el mismo comprobante
+        self._agregar(self.t40, 1)
+        self._comprar()
+        respuesta = self.client.post(reverse('web:pagoPedido'), self._formulario())
+        self.assertContains(respuesta, 'ya fue registrado')
+
+    def test_una_fecha_futura_se_rechaza(self):
+        self._agregar(self.t40, 1)
+        self._comprar()
+
+        manana = (timezone.localdate() + timedelta(days=1)).isoformat()
+        respuesta = self.client.post(
+            reverse('web:pagoPedido'), self._formulario(fecha_pago=manana)
+        )
+        self.assertContains(respuesta, 'todavia no llego')
+
+    def test_con_un_comprobante_pendiente_no_se_sube_otro(self):
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+        self.client.post(reverse('web:pagoPedido'), self._formulario())
+
+        respuesta = self.client.get(reverse('web:pagoPedido'))
+        self.assertContains(respuesta, 'Recibimos tu comprobante')
+        self.assertNotContains(respuesta, 'Enviar comprobante')
+        self.assertEqual(pedido.pagos.count(), 1)
+
+
+@ARCHIVOS_APARTE
+class VoucherProtegidoTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """
+    El voucher es el pantallazo bancario del cliente. No puede quedar suelto en
+    /media/, donde cualquiera con la URL lo lee.
+    """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B010-1', [(self.t40, 10, Decimal('300.00'))], aplicar=True)
+        self.cuenta = _cuenta_bcp()
+        self._agregar(self.t40, 1)
+        self.pedido = self._comprar()
+        self.pago = self.pedido.declarar_pago(
+            cuenta=self.cuenta,
+            monto_declarado=self.pedido.monto_total,
+            nro_operacion='OP-5555',
+            voucher=_imagen(),
+            fecha_pago=timezone.localdate(),
+        )
+        self.url = reverse('web:voucherPago', args=[self.pago.id])
+
+    def test_quien_hizo_el_pedido_lo_ve(self):
+        # la sesion del test es la del comprador que acaba de subirlo
+        self.assertEqual(self.client.get(self.url).status_code, 200)
+
+    def test_un_extrano_no_lo_ve(self):
+        otro = Client()
+        self.assertEqual(otro.get(self.url).status_code, 404)
+
+    def test_un_usuario_cualquiera_tampoco(self):
+        otro = Client()
+        User.objects.create_user('curioso', 'curioso@ejemplo.com', 'clave-de-prueba')
+        otro.login(username='curioso', password='clave-de-prueba')
+        self.assertEqual(otro.get(self.url).status_code, 404)
+
+    def test_el_staff_si_lo_ve(self):
+        equipo = Client()
+        equipo.force_login(
+            User.objects.create_superuser('jefa', 'jefa@goatx.pe', 'clave-de-prueba')
+        )
+        self.assertEqual(equipo.get(self.url).status_code, 200)
+
+    def test_el_archivo_no_vive_bajo_media(self):
+        """
+        Lo que esta bajo MEDIA_ROOT lo entrega Django en desarrollo y Nginx en
+        produccion sin preguntar quien pide. La vista con permisos no sirve de
+        nada si el archivo tambien se puede pedir por su ruta.
+        """
+        ruta = os.path.abspath(self.pago.voucher.path)
+        self.assertFalse(ruta.startswith(os.path.abspath(MEDIA_TEMPORAL)))
+        self.assertTrue(ruta.startswith(os.path.abspath(PRIVADO_TEMPORAL)))
+
+    def test_el_voucher_no_tiene_url_publica(self):
+        with self.assertRaises(ValueError):
+            self.pago.voucher.url
+
+    def test_un_voucher_inexistente_da_404(self):
+        equipo = Client()
+        equipo.force_login(
+            User.objects.create_superuser('jefe2', 'jefe2@goatx.pe', 'clave-de-prueba')
+        )
+        self.assertEqual(equipo.get(reverse('web:voucherPago', args=[99999])).status_code, 404)
+
+
+@ARCHIVOS_APARTE
+class AdminPagoTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """ La bandeja de comprobantes, por donde se validan """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B011-1', [(self.t40, 10, Decimal('300.00'))], aplicar=True)
+        self.cuenta = _cuenta_bcp()
+        self._agregar(self.t40, 1)
+        self.pedido = self._comprar()
+        self.pago = self.pedido.declarar_pago(
+            cuenta=self.cuenta,
+            monto_declarado=self.pedido.monto_total,
+            nro_operacion='OP-9001',
+            voucher=_imagen(),
+            fecha_pago=timezone.localdate(),
+        )
+        self.client.force_login(
+            User.objects.create_superuser('cajera', 'cajera@goatx.pe', 'clave-de-prueba')
+        )
+
+    def test_la_bandeja_lista_los_comprobantes(self):
+        respuesta = self.client.get(reverse('admin:web_pago_changelist'))
+        self.assertContains(respuesta, 'OP-9001')
+        self.assertContains(respuesta, self.pedido.nro_pedido)
+
+    def test_la_ficha_del_comprobante_abre_sin_romperse(self):
+        # el voucher ya no tiene .url: si el admin la pidiera al pintarlo como
+        # campo de solo lectura, esta pantalla reventaria
+        respuesta = self.client.get(reverse('admin:web_pago_change', args=[self.pago.pk]))
+        self.assertEqual(respuesta.status_code, 200)
+        self.assertContains(respuesta, 'OP-9001')
+
+    def test_un_comprobante_no_se_crea_a_mano(self):
+        respuesta = self.client.get(reverse('admin:web_pago_add'))
+        self.assertEqual(respuesta.status_code, 403)
+
+    def test_un_comprobante_no_se_borra(self):
+        respuesta = self.client.get(reverse('admin:web_pago_delete', args=[self.pago.pk]))
+        self.assertEqual(respuesta.status_code, 403)
+
+    def test_validar_pide_el_monto_antes_de_mover_nada(self):
+        respuesta = self.client.post(reverse('admin:web_pago_changelist'), {
+            'action': 'validar_pago', '_selected_action': [self.pago.pk],
+        })
+        self.assertContains(respuesta, 'Monto que viste en tu cuenta')
+
+        self.pago.refresh_from_db()
+        self.pedido.refresh_from_db()
+        self.assertEqual(self.pago.estado, Pago.PENDIENTE)
+        self.assertEqual(self.pedido.estado, Pedido.EN_VALIDACION)
+
+    def test_validar_desde_el_admin_marca_el_pedido_pagado(self):
+        self.client.post(reverse('admin:web_pago_changelist'), {
+            'action': 'validar_pago', '_selected_action': [self.pago.pk],
+            'aplicar': 'Validar', 'monto_confirmado': str(self.pedido.monto_total),
+        })
+
+        self.pago.refresh_from_db()
+        self.pedido.refresh_from_db()
+        self.assertEqual(self.pago.estado, Pago.VALIDADO)
+        self.assertEqual(self.pago.validado_por.username, 'cajera')
+        self.assertEqual(self.pedido.estado, Pedido.PAGADO)
+
+    def test_rechazar_desde_el_admin_deja_el_motivo(self):
+        self.client.post(reverse('admin:web_pago_changelist'), {
+            'action': 'rechazar_pago', '_selected_action': [self.pago.pk],
+            'aplicar': 'Rechazar', 'motivo': 'El monto no coincide con el pedido',
+        })
+
+        self.pago.refresh_from_db()
+        self.pedido.refresh_from_db()
+        self.assertEqual(self.pago.estado, Pago.RECHAZADO)
+        self.assertEqual(self.pedido.estado, Pedido.EN_VALIDACION)
+        self.assertIn('no coincide', self.pago.motivo_rechazo)
+
+    def test_el_pedido_no_se_marca_pagado_a_mano(self):
+        # la accion se quito a proposito: un pedido llega a Pagado con su
+        # comprobante detras, nunca con un cambio de estado suelto
+        respuesta = self.client.get(reverse('admin:web_pedido_changelist'))
+        self.assertNotContains(respuesta, 'marcar_pagado')
+
+
+@ARCHIVOS_APARTE
+class ReservaConVencimientoTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """
+    Reservar compromete unidades sin sacarlas del almacen, y con plazo.
+
+    Antes, hacer clic en "Realizar pedido" descontaba el stock y escribia una
+    venta en el kardex aunque el par siguiera en el estante; si el cliente no
+    pagaba, esa unidad quedaba muerta para siempre.
+    """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B012-1', [(self.t40, 2, Decimal('300.00'))], aplicar=True)
+        self.cuenta = _cuenta_bcp()
+
+    def _envejecer(self, pedido, minutos=30):
+        """ Mueve el vencimiento al pasado, para no esperar el reloj real """
+        Pedido.objects.filter(pk=pedido.pk).update(
+            reserva_vence=timezone.now() - timedelta(minutes=minutos)
+        )
+        pedido.refresh_from_db()
+        return pedido
+
+    # --- el reloj ---
+
+    def test_el_pedido_nace_con_su_plazo(self):
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+
+        self.assertIsNotNone(pedido.reserva_vence)
+        faltan = pedido.segundos_restantes
+        self.assertGreater(faltan, settings.MINUTOS_RESERVA * 60 - 60)
+        self.assertLessEqual(faltan, settings.MINUTOS_RESERVA * 60)
+
+    def test_el_comprobante_detiene_el_reloj(self):
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+        vencia = pedido.reserva_vence
+
+        pedido.declarar_pago(
+            cuenta=self.cuenta, monto_declarado=pedido.monto_total,
+            nro_operacion='OP-3001', voucher=_imagen(), fecha_pago=timezone.localdate(),
+        )
+        pedido.refresh_from_db()
+
+        # deja de correr contra el cliente: el plazo que queda es nuestro
+        self.assertGreater(pedido.reserva_vence, vencia)
+        self.assertGreater(pedido.segundos_restantes, settings.MINUTOS_RESERVA * 60)
+
+    def test_al_pagar_el_reloj_se_apaga(self):
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+        self._pagar(pedido)
+
+        pedido.refresh_from_db()
+        self.assertIsNone(pedido.reserva_vence)
+        self.assertIsNone(pedido.segundos_restantes)
+
+    # --- vencer suelta las unidades ---
+
+    def test_una_reserva_vencida_suelta_las_unidades(self):
+        self._agregar(self.t40, 2)
+        pedido = self._envejecer(self._comprar())
+
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.disponible, 0)
+
+        self.assertEqual(Pedido.vencer_reservas(), 1)
+
+        pedido.refresh_from_db()
+        self.t40.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.CANCELADO)
+        self.assertIn('plazo', pedido.motivo_cancelacion)
+        self.assertEqual(self.t40.disponible, 2)
+        self.assertEqual(self.t40.stock, 2)          # nunca se movieron del estante
+
+    def test_una_reserva_viva_no_se_toca(self):
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+
+        self.assertEqual(Pedido.vencer_reservas(), 0)
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.SOLICITADO)
+
+    def test_el_checkout_suelta_lo_vencido_antes_de_mirar(self):
+        """ El sistema se corrige solo, sin depender de que corra el comando """
+        self._agregar(self.t40, 2)
+        self._envejecer(self._comprar())
+
+        # otro cliente entra a comprar las mismas unidades
+        otro = Client()
+        otro.post(reverse('web:agregarCarrito'), {
+            'item_id': self.t40.id, 'cantidad': 2, 'sku': self.t40.variante.sku,
+        })
+        otro.get(reverse('web:continuarComoInvitado'))
+        otro.post(reverse('web:registrarPedido'), DATOS_CHECKOUT)
+
+        self.assertEqual(Pedido.objects.filter(estado=Pedido.SOLICITADO).count(), 1)
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.reservado, 2)
+
+    def test_dos_clientes_no_reservan_la_misma_unidad(self):
+        self._agregar(self.t40, 2)
+        self._comprar()
+
+        otro = Client()
+        otro.post(reverse('web:agregarCarrito'), {
+            'item_id': self.t40.id, 'cantidad': 2, 'sku': self.t40.variante.sku,
+        })
+        respuesta = otro.get(reverse('web:carrito'))
+        self.assertContains(respuesta, 'sin stock')
+        self.assertEqual(Pedido.objects.count(), 1)
+
+    # --- la pantalla ---
+
+    def test_la_pantalla_muestra_la_cuenta_regresiva(self):
+        self._agregar(self.t40, 1)
+        self._comprar()
+
+        respuesta = self.client.get(reverse('web:pagoPedido'))
+        self.assertContains(respuesta, 'Te guardamos el producto por')
+        self.assertContains(respuesta, 'pg-reloj')
+        self.assertGreater(respuesta.context['segundos'], 0)
+
+    def test_al_vencer_la_pantalla_avisa_y_deja_declarar(self):
+        self._agregar(self.t40, 1)
+        pedido = self._envejecer(self._comprar())
+
+        respuesta = self.client.get(reverse('web:pagoPedido'))
+        self.assertContains(respuesta, 'Se vencio el plazo')
+        self.assertContains(respuesta, 'mandanos el comprobante igual')
+        self.assertContains(respuesta, 'Enviar comprobante')
+
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.CANCELADO)
+
+    def test_una_vez_vencido_ya_no_hay_reloj(self):
+        self._agregar(self.t40, 1)
+        self._envejecer(self._comprar())
+
+        respuesta = self.client.get(reverse('web:pagoPedido'))
+        self.assertIsNone(respuesta.context['segundos'])
+
+    # --- pago tardio ---
+
+    def test_el_pago_tardio_llega_marcado(self):
+        self._agregar(self.t40, 1)
+        pedido = self._envejecer(self._comprar())
+        Pedido.vencer_reservas()
+
+        pago = pedido.declarar_pago(
+            cuenta=self.cuenta, monto_declarado=pedido.monto_total,
+            nro_operacion='OP-3002', voucher=_imagen(), fecha_pago=timezone.localdate(),
+        )
+        self.assertTrue(pago.fuera_de_plazo)
+
+    def test_validar_un_pago_tardio_revive_el_pedido_si_hay_stock(self):
+        self._agregar(self.t40, 1)
+        pedido = self._envejecer(self._comprar())
+        Pedido.vencer_reservas()
+
+        pago = pedido.declarar_pago(
+            cuenta=self.cuenta, monto_declarado=pedido.monto_total,
+            nro_operacion='OP-3003', voucher=_imagen(), fecha_pago=timezone.localdate(),
+        )
+        pago.validar(pedido.monto_total)
+
+        pedido.refresh_from_db()
+        self.t40.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.PAGADO)
+        self.assertEqual(pedido.motivo_cancelacion, '')
+        self.assertEqual(self.t40.stock, 1)          # la unidad salio de verdad
+        self.assertEqual(self.t40.stock_segun_kardex, 1)
+
+    def test_validar_un_pago_tardio_sin_stock_avisa_que_hay_que_devolver(self):
+        self._agregar(self.t40, 2)
+        tarde = self._envejecer(self._comprar())
+        Pedido.vencer_reservas()
+
+        # otro cliente se lleva las dos unidades y paga
+        otro = Client()
+        otro.post(reverse('web:agregarCarrito'), {
+            'item_id': self.t40.id, 'cantidad': 2, 'sku': self.t40.variante.sku,
+        })
+        otro.get(reverse('web:continuarComoInvitado'))
+        otro.post(reverse('web:registrarPedido'), DATOS_CHECKOUT)
+        self._pagar(Pedido.objects.latest('id'), nro='OP-OTRO')
+
+        pago = tarde.declarar_pago(
+            cuenta=self.cuenta, monto_declarado=tarde.monto_total,
+            nro_operacion='OP-3004', voucher=_imagen(), fecha_pago=timezone.localdate(),
+        )
+        with self.assertRaises(ValueError) as fallo:
+            pago.validar(tarde.monto_total)
+        self.assertIn('devolverle el dinero', str(fallo.exception))
+
+        tarde.refresh_from_db()
+        self.assertEqual(tarde.estado, Pedido.CANCELADO)
+
+    # --- el comando ---
+
+    def test_el_comando_simula_sin_tocar_nada(self):
+        self._agregar(self.t40, 1)
+        pedido = self._envejecer(self._comprar())
+
+        salida = StringIO()
+        call_command('vencer_reservas', '--simular', stdout=salida)
+        self.assertIn(pedido.nro_pedido, salida.getvalue())
+
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.SOLICITADO)
+
+    def test_el_comando_suelta_las_reservas_vencidas(self):
+        self._agregar(self.t40, 1)
+        pedido = self._envejecer(self._comprar())
+
+        salida = StringIO()
+        call_command('vencer_reservas', stdout=salida)
+        self.assertIn('vuelven a estar a la venta', salida.getvalue())
+
+        pedido.refresh_from_db()
+        self.t40.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.CANCELADO)
+        self.assertEqual(self.t40.disponible, 2)
+
+    def test_sin_vencidas_el_comando_lo_dice(self):
+        salida = StringIO()
+        call_command('vencer_reservas', stdout=salida)
+        self.assertIn('No hay reservas vencidas', salida.getvalue())
+
+
+class RecojoEnTiendaTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """
+    El cliente elige entre que se lo lleven o retirarlo en un mostrador nuestro.
+
+    Los cuatro puntos los siembra la migracion 0022, asi que estan disponibles
+    en cualquier base.
+    """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B013-1', [(self.t40, 5, Decimal('300.00'))], aplicar=True)
+        self.punto = PuntoRecojo.objects.get(nombre='Monetix')
+
+    def _confirmar(self, **cambios):
+        self.client.get(reverse('web:continuarComoInvitado'))
+        datos = dict(DATOS_CHECKOUT)
+        datos.update(cambios)
+        return self.client.post(reverse('web:registrarPedido'), datos)
+
+    def _recoger(self, punto=None, **cambios):
+        return self._confirmar(
+            modo_entrega='R', punto_recojo=(punto or self.punto).id, **cambios
+        )
+
+    # --- la pantalla ---
+
+    def _abrir_checkout(self):
+        """ Un invitado primero elige comprar sin cuenta, si no lo mandan a identificarse """
+        self._agregar(self.t40, 1)
+        self.client.get(reverse('web:continuarComoInvitado'))
+        return self.client.get(reverse('web:registrarPedido'))
+
+    def test_el_checkout_ofrece_los_cuatro_puntos(self):
+        respuesta = self._abrir_checkout()
+
+        for nombre in ('Tienda GOAT X', 'Vision para crecer', 'Daily Credits', 'Monetix'):
+            self.assertContains(respuesta, nombre)
+        self.assertContains(respuesta, 'Como quieres recibirlo')
+
+    def test_un_punto_desactivado_no_se_ofrece(self):
+        PuntoRecojo.objects.filter(nombre='Daily Credits').update(activo=False)
+
+        respuesta = self._abrir_checkout()
+        self.assertNotContains(respuesta, 'Daily Credits')
+        self.assertContains(respuesta, 'Monetix')
+
+    # --- el pedido ---
+
+    def test_recojo_guarda_el_punto(self):
+        self._agregar(self.t40, 1)
+        self._recoger()
+
+        pedido = Pedido.objects.latest('id')
+        self.assertTrue(pedido.es_recojo)
+        self.assertEqual(pedido.punto_recojo, self.punto)
+
+    def test_el_pedido_copia_la_direccion_del_punto(self):
+        """ Fotografia, no referencia: si manana cierra, el pedido no cambia """
+        self._agregar(self.t40, 1)
+        self._recoger()
+        pedido = Pedido.objects.latest('id')
+
+        PuntoRecojo.objects.filter(pk=self.punto.pk).update(
+            nombre='Otro nombre', direccion='Otra calle 999'
+        )
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.punto_recojo_nombre, 'Monetix')
+        self.assertIn('Jr. La Union 104', pedido.punto_recojo_direccion)
+        self.assertIn('Lircay', pedido.punto_recojo_direccion)
+
+    def test_recojo_no_exige_direccion(self):
+        self._agregar(self.t40, 1)
+        respuesta = self._recoger(
+            direccion='', departamento='', provincia='', distrito=''
+        )
+        self.assertRedirects(respuesta, reverse('web:pagoPedido'))
+
+    def test_recojo_descarta_la_direccion_que_se_haya_escrito(self):
+        """ Un pedido que se retira no debe guardar una direccion que nadie usa """
+        self._agregar(self.t40, 1)
+        self._recoger()
+
+        pedido = Pedido.objects.latest('id')
+        self.assertEqual(pedido.direccion_envio, '')
+        self.assertEqual(pedido.distrito_envio, '')
+
+    def test_envio_sigue_exigiendo_direccion(self):
+        self._agregar(self.t40, 1)
+        respuesta = self._confirmar(direccion='')
+
+        self.assertEqual(respuesta.status_code, 200)
+        self.assertContains(respuesta, 'hace falta la direccion')
+        self.assertEqual(Pedido.objects.count(), 0)
+
+    def test_recojo_sin_elegir_punto_se_rechaza(self):
+        self._agregar(self.t40, 1)
+        respuesta = self._confirmar(modo_entrega='R')
+
+        self.assertEqual(respuesta.status_code, 200)
+        self.assertContains(respuesta, 'Elige donde vas a retirar')
+        self.assertEqual(Pedido.objects.count(), 0)
+
+    def test_un_pedido_de_envio_no_guarda_punto(self):
+        self._agregar(self.t40, 1)
+        self._confirmar()
+
+        pedido = Pedido.objects.latest('id')
+        self.assertFalse(pedido.es_recojo)
+        self.assertIsNone(pedido.punto_recojo)
+        self.assertEqual(pedido.punto_recojo_nombre, '')
+
+    # --- el ciclo se bifurca ---
+
+    def test_el_ciclo_de_recojo_no_pasa_por_enviado(self):
+        self._agregar(self.t40, 1)
+        self._recoger()
+        pedido = Pedido.objects.latest('id')
+        self._avanzar(pedido, Pedido.PAGADO)
+
+        siguientes = dict(pedido.estados_siguientes)
+        self.assertIn(Pedido.LISTO_RECOJO, siguientes)
+        self.assertNotIn(Pedido.ENVIADO, siguientes)
+
+        with self.assertRaises(ValueError):
+            pedido.cambiar_estado(Pedido.ENVIADO)
+
+    def test_el_ciclo_de_envio_no_pasa_por_listo_para_recojo(self):
+        self._agregar(self.t40, 1)
+        self._confirmar()
+        pedido = Pedido.objects.latest('id')
+        self._avanzar(pedido, Pedido.PAGADO)
+
+        with self.assertRaises(ValueError):
+            pedido.cambiar_estado(Pedido.LISTO_RECOJO)
+
+    def test_recojo_llega_hasta_entregado(self):
+        self._agregar(self.t40, 1)
+        self._recoger()
+        pedido = Pedido.objects.latest('id')
+
+        self._avanzar(pedido, Pedido.PAGADO)
+        pedido.cambiar_estado(Pedido.LISTO_RECOJO)
+        pedido.cambiar_estado(Pedido.ENTREGADO)
+
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.ENTREGADO)
+
+    def test_listo_para_recojo_sigue_con_el_stock_descontado(self):
+        self._agregar(self.t40, 2)
+        self._recoger()
+        pedido = Pedido.objects.latest('id')
+        self._avanzar(pedido, Pedido.PAGADO)
+        pedido.cambiar_estado(Pedido.LISTO_RECOJO)
+
+        self.t40.refresh_from_db()
+        self.assertTrue(pedido.descontado)
+        self.assertEqual(self.t40.stock, 3)
+        self.assertEqual(self.t40.reservado, 0)
+
+    # --- lo que ve el cliente despues ---
+
+    def test_gracias_muestra_donde_retirar(self):
+        self._agregar(self.t40, 1)
+        self._recoger()
+
+        respuesta = self.client.get(reverse('web:gracias'))
+        self.assertContains(respuesta, 'Recojo en tienda')
+        self.assertContains(respuesta, 'Monetix')
+        self.assertContains(respuesta, 'Jr. La Union 104')
+        self.assertNotContains(respuesta, 'Telefono:')
+
+    def test_gracias_muestra_la_direccion_si_es_envio(self):
+        self._agregar(self.t40, 1)
+        self._confirmar()
+
+        respuesta = self.client.get(reverse('web:gracias'))
+        self.assertContains(respuesta, 'Envio')
+        self.assertContains(respuesta, 'Av. Manchego Munoz 431')
+
+    def test_donde_recibe_resume_en_una_linea(self):
+        self._agregar(self.t40, 1)
+        self._recoger()
+        pedido = Pedido.objects.latest('id')
+        self.assertIn('Monetix', pedido.donde_recibe)
+        self.assertIn('Lircay', pedido.donde_recibe)
+
+
+@ARCHIVOS_APARTE
+class AdminRecojoTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """ El mostrador se marca listo desde el admin, y ahi el cliente tiene fecha """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B014-1', [(self.t40, 5, Decimal('300.00'))], aplicar=True)
+        self.punto = PuntoRecojo.objects.get(nombre='Tienda GOAT X')
+
+        self.client.get(reverse('web:continuarComoInvitado'))
+        self._agregar(self.t40, 1)
+        datos = dict(DATOS_CHECKOUT, modo_entrega='R', punto_recojo=self.punto.id)
+        self.client.post(reverse('web:registrarPedido'), datos)
+        self.pedido = Pedido.objects.latest('id')
+        self._pagar(self.pedido, nro='OP-RECOJO')
+        self.pedido.refresh_from_db()
+
+        self.client.force_login(
+            User.objects.create_superuser('tienda', 'tienda@goatx.pe', 'clave-de-prueba')
+        )
+
+    def test_los_puntos_se_administran(self):
+        respuesta = self.client.get(reverse('admin:web_puntorecojo_changelist'))
+        self.assertContains(respuesta, 'Tienda GOAT X')
+        self.assertContains(respuesta, 'Lircay')
+
+    def test_marcar_listo_para_recojo_desde_el_admin(self):
+        self.client.post(reverse('admin:web_pedido_changelist'), {
+            'action': 'marcar_listo_recojo', '_selected_action': [self.pedido.pk],
+        })
+        self.pedido.refresh_from_db()
+        self.assertEqual(self.pedido.estado, Pedido.LISTO_RECOJO)
+
+    def test_un_pedido_de_recojo_no_se_marca_enviado(self):
+        self.client.post(reverse('admin:web_pedido_changelist'), {
+            'action': 'marcar_enviado', '_selected_action': [self.pedido.pk],
+        })
+        self.pedido.refresh_from_db()
+        self.assertEqual(self.pedido.estado, Pedido.PAGADO)
+
+    def test_la_lista_dice_donde_recibe(self):
+        respuesta = self.client.get(reverse('admin:web_pedido_changelist'))
+        self.assertContains(respuesta, 'Recojo')
+        self.assertContains(respuesta, 'Tienda GOAT X')
+
+
+@ARCHIVOS_APARTE
+class AvisoDePagoTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """
+    El cuello de botella para validar rapido no es la pantalla: es enterarse.
+    """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B015-1', [(self.t40, 5, Decimal('300.00'))], aplicar=True)
+        self.cuenta = _cuenta_bcp()
+        self._agregar(self.t40, 1)
+        self.pedido = self._comprar()
+
+    def _declarar(self, nro='OP-AVISO'):
+        # el correo sale con transaction.on_commit, que en un TestCase no corre
+        # solo: la transaccion se revierte y nunca hay commit
+        with self.captureOnCommitCallbacks(execute=True):
+            return self.pedido.declarar_pago(
+                cuenta=self.cuenta,
+                monto_declarado=self.pedido.monto_total,
+                nro_operacion=nro,
+                voucher=_imagen(),
+                fecha_pago=timezone.localdate(),
+            )
+
+    @override_settings(CORREOS_AVISO=['jefe@goatx.pe'])
+    def test_llega_un_correo_al_declarar_el_pago(self):
+        mail.outbox = []
+        self._declarar()
+
+        self.assertEqual(len(mail.outbox), 1)
+        aviso = mail.outbox[0]
+        self.assertEqual(aviso.to, ['jefe@goatx.pe'])
+        self.assertIn(self.pedido.nro_pedido, aviso.subject)
+        self.assertIn('OP-AVISO', aviso.body)
+        self.assertIn(str(settings.HORAS_VALIDACION), aviso.body)
+
+    @override_settings(CORREOS_AVISO=['jefe@goatx.pe'])
+    def test_el_correo_trae_el_enlace_para_validar(self):
+        mail.outbox = []
+        pago = self._declarar()
+        self.assertIn(reverse('web:validarPago', args=[pago.id]), mail.outbox[0].body)
+
+    @override_settings(CORREOS_AVISO=[])
+    def test_sin_destinatarios_no_se_manda_nada(self):
+        mail.outbox = []
+        self._declarar()
+        self.assertEqual(len(mail.outbox), 0)
+
+
+@ARCHIVOS_APARTE
+class BandejaMovilTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """ La pantalla de validacion pensada para el celular """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B016-1', [(self.t40, 8, Decimal('300.00'))], aplicar=True)
+        self.cuenta = _cuenta_bcp()
+        self._agregar(self.t40, 1)
+        self.pedido = self._comprar()
+        self.pago = self.pedido.declarar_pago(
+            cuenta=self.cuenta, monto_declarado=self.pedido.monto_total,
+            nro_operacion='OP-MOVIL', voucher=_imagen(), fecha_pago=timezone.localdate(),
+        )
+        self.equipo = Client()
+        self.equipo.force_login(
+            User.objects.create_superuser('validador', 'v@goatx.pe', 'clave-de-prueba')
+        )
+
+    # --- permisos ---
+
+    def test_un_extrano_no_entra_a_la_bandeja(self):
+        respuesta = Client().get(reverse('web:validarPagos'))
+        self.assertNotEqual(respuesta.status_code, 200)
+
+    def test_un_cliente_logueado_tampoco(self):
+        otro = Client()
+        User.objects.create_user('cliente', 'c@ejemplo.com', 'clave-de-prueba')
+        otro.login(username='cliente', password='clave-de-prueba')
+        self.assertNotEqual(otro.get(reverse('web:validarPagos')).status_code, 200)
+
+    # --- la cola ---
+
+    def test_la_bandeja_lista_lo_pendiente(self):
+        respuesta = self.equipo.get(reverse('web:validarPagos'))
+        self.assertContains(respuesta, self.pedido.nro_pedido)
+        self.assertContains(respuesta, 'OP-MOVIL')
+        self.assertContains(respuesta, 'evidencia, no prueba')
+
+    def test_el_mas_viejo_va_primero(self):
+        self._agregar(self.t40, 1)
+        nuevo = self._comprar()
+        nuevo.declarar_pago(
+            cuenta=self.cuenta, monto_declarado=nuevo.monto_total,
+            nro_operacion='OP-NUEVO', voucher=_imagen(), fecha_pago=timezone.localdate(),
+        )
+        Pago.objects.filter(nro_operacion='OP-MOVIL').update(
+            creado=timezone.now() - timedelta(hours=8)
+        )
+
+        pendientes = self.equipo.get(reverse('web:validarPagos')).context['pendientes']
+        self.assertEqual(list(pendientes)[0].nro_operacion, 'OP-MOVIL')
+
+    def test_sin_pendientes_lo_dice(self):
+        self.pago.validar(self.pedido.monto_total)
+        respuesta = self.equipo.get(reverse('web:validarPagos'))
+        self.assertContains(respuesta, 'No hay nada esperando')
+
+    def test_lo_demorado_se_marca(self):
+        Pago.objects.filter(pk=self.pago.pk).update(
+            creado=timezone.now() - timedelta(hours=settings.HORAS_ALERTA_VALIDACION + 1)
+        )
+        self.pago.refresh_from_db()
+        self.assertTrue(self.pago.demorado)
+        self.assertContains(self.equipo.get(reverse('web:validarPagos')), 'vp-demorado')
+
+    def test_lo_reciente_no_se_marca(self):
+        self.assertFalse(self.pago.demorado)
+        self.assertIn('h', self.pago.espera)
+
+    # --- validar y rechazar ---
+
+    def test_validar_desde_el_celular(self):
+        respuesta = self.equipo.post(
+            reverse('web:validarPago', args=[self.pago.id]),
+            {'validar': '1', 'monto_confirmado': str(self.pedido.monto_total)},
+        )
+        self.assertRedirects(respuesta, reverse('web:validarPagos'))
+
+        self.pago.refresh_from_db()
+        self.pedido.refresh_from_db()
+        self.assertEqual(self.pago.estado, Pago.VALIDADO)
+        self.assertEqual(self.pago.validado_por.username, 'validador')
+        self.assertEqual(self.pedido.estado, Pedido.PAGADO)
+
+    def test_validar_sin_monto_no_pasa(self):
+        respuesta = self.equipo.post(
+            reverse('web:validarPago', args=[self.pago.id]), {'validar': '1'}
+        )
+        self.assertEqual(respuesta.status_code, 200)
+
+        self.pago.refresh_from_db()
+        self.assertEqual(self.pago.estado, Pago.PENDIENTE)
+
+    def test_una_diferencia_se_avisa(self):
+        respuesta = self.equipo.post(
+            reverse('web:validarPago', args=[self.pago.id]),
+            {'validar': '1', 'monto_confirmado': '100.00'},
+            follow=True,
+        )
+        self.assertContains(respuesta, 'diferencia')
+
+        self.pago.refresh_from_db()
+        self.assertFalse(self.pago.cuadra)
+
+    def test_rechazar_desde_el_celular(self):
+        self.equipo.post(
+            reverse('web:validarPago', args=[self.pago.id]),
+            {'rechazar': '1', 'motivo': 'La captura esta cortada, no se lee el monto'},
+        )
+        self.pago.refresh_from_db()
+        self.pedido.refresh_from_db()
+        self.assertEqual(self.pago.estado, Pago.RECHAZADO)
+        self.assertEqual(self.pedido.estado, Pedido.EN_VALIDACION)
+
+    def test_rechazar_sin_motivo_no_pasa(self):
+        self.equipo.post(
+            reverse('web:validarPago', args=[self.pago.id]), {'rechazar': '1', 'motivo': ''}
+        )
+        self.pago.refresh_from_db()
+        self.assertEqual(self.pago.estado, Pago.PENDIENTE)
+
+    def test_un_pago_resuelto_ya_no_muestra_los_botones(self):
+        self.pago.validar(self.pedido.monto_total)
+        respuesta = self.equipo.get(reverse('web:validarPago', args=[self.pago.id]))
+        self.assertContains(respuesta, 'ya esta validado')
+        self.assertNotContains(respuesta, 'Confirmar el pago')
+
+    def test_la_ficha_muestra_donde_recibe(self):
+        respuesta = self.equipo.get(reverse('web:validarPago', args=[self.pago.id]))
+        self.assertContains(respuesta, 'Total del pedido')
+        self.assertContains(respuesta, self.pedido.donde_recibe)
+
+
+class _CiudadesMixin(_AlmacenMixin):
+    """ Las dos ciudades ya vienen sembradas por la migracion 0024 """
+
+    def _montar_ciudades(self):
+        self._montar_almacen()
+        self.huancavelica = Ubicacion.objects.get(nombre='Huancavelica')
+        self.lircay = Ubicacion.objects.get(nombre='Lircay')
+
+    def _viaje(self, dias=3):
+        sale = timezone.localdate() + timedelta(days=dias)
+        return Traslado.objects.create(
+            origen=self.huancavelica,
+            destino=self.lircay,
+            fecha_despacho=sale,
+            fecha_disponible=sale + timedelta(days=self.lircay.dias_viaje),
+        )
+
+
+class TrasladoTests(_CiudadesMixin, TestCase):
+    """
+    El documento planifica el viaje, no la mercaderia.
+
+    Reservar el lunes lo que sale el sabado bloquea cinco dias un par que
+    todavia nadie compro, y se pierden ventas seguras en la ciudad donde esta.
+    """
+
+    def setUp(self):
+        self._montar_ciudades()
+        self._compra('B017-1', [(self.t40, 6, Decimal('300.00'))], aplicar=True)
+        self.t40.refresh_from_db()
+
+    def test_el_documento_nace_vacio_y_no_reserva_nada(self):
+        self._viaje()
+
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.reservado, 0)
+        self.assertEqual(self.t40.disponible, 6)
+
+    def test_agregar_por_stock_reserva_recien_ahi(self):
+        viaje = self._viaje()
+        viaje.agregar(self.t40, 2)
+
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.reservado, 2)
+        self.assertEqual(self.t40.stock, 6)          # siguen en el estante
+        self.assertEqual(self.t40.disponible, 4)
+
+    def test_quitar_una_linea_devuelve_las_unidades(self):
+        viaje = self._viaje()
+        linea = viaje.agregar(self.t40, 2)
+        linea.delete()
+
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.disponible, 6)
+
+    def test_agregar_crea_la_fila_del_destino(self):
+        viaje = self._viaje()
+        linea = viaje.agregar(self.t40, 2)
+
+        self.assertEqual(linea.item_destino.ubicacion, self.lircay)
+        self.assertEqual(linea.item_destino.stock, 0)
+        self.assertEqual(linea.item_destino.variante_id, self.t40.variante_id)
+
+    def test_no_se_manda_algo_que_no_esta_en_el_origen(self):
+        viaje = self._viaje()
+        ajeno = Inventario.objects.create(
+            variante=self.variante, valor=_valor_talla('44', 9), ubicacion=self.lircay
+        )
+        with self.assertRaises(ValueError):
+            viaje.agregar(ajeno, 1)
+
+    # --- despachar ---
+
+    def test_despachar_saca_del_stock_y_escribe_el_kardex(self):
+        viaje = self._viaje()
+        viaje.agregar(self.t40, 2)
+        viaje.despachar()
+
+        self.t40.refresh_from_db()
+        self.assertEqual(viaje.estado, Traslado.EN_TRANSITO)
+        self.assertEqual(self.t40.stock, 4)          # ahora si salieron
+        self.assertEqual(self.t40.reservado, 0)
+
+        salida = self.t40.movimientos.get(tipo=MovimientoInventario.TRASLADO_SALIDA)
+        self.assertEqual(salida.cantidad, -2)
+        self.assertEqual(salida.traslado, viaje)
+
+    def test_un_viaje_vacio_no_sale(self):
+        with self.assertRaises(ValueError):
+            self._viaje().despachar()
+
+    def test_un_viaje_despachado_no_se_edita(self):
+        viaje = self._viaje()
+        viaje.agregar(self.t40, 1)
+        viaje.despachar()
+
+        with self.assertRaises(ValueError):
+            viaje.agregar(self.t40, 1)
+
+    def test_no_se_despacha_dos_veces(self):
+        viaje = self._viaje()
+        viaje.agregar(self.t40, 1)
+        viaje.despachar()
+        with self.assertRaises(ValueError):
+            viaje.despachar()
+
+    # --- recibir contando ---
+
+    def test_recibir_suma_al_destino(self):
+        viaje = self._viaje()
+        linea = viaje.agregar(self.t40, 2)
+        viaje.despachar()
+        viaje.recibir()
+
+        destino = Inventario.objects.get(pk=linea.item_destino_id)
+        self.assertEqual(viaje.estado, Traslado.RECIBIDO)
+        self.assertEqual(destino.stock, 2)
+        self.assertEqual(destino.stock_segun_kardex, 2)
+
+    def test_recibir_con_faltante_deja_la_diferencia_escrita(self):
+        viaje = self._viaje()
+        linea = viaje.agregar(self.t40, 3)
+        viaje.despachar()
+        viaje.recibir(conteo={linea.id: 2})          # llegaron 2 de 3
+
+        linea.refresh_from_db()
+        destino = Inventario.objects.get(pk=linea.item_destino_id)
+        self.assertEqual(linea.cantidad_recibida, 2)
+        self.assertEqual(linea.faltante, 1)
+        self.assertEqual(destino.stock, 2)
+
+    def test_lo_que_no_llego_no_aparece_en_el_kardex_del_destino(self):
+        viaje = self._viaje()
+        linea = viaje.agregar(self.t40, 3)
+        viaje.despachar()
+        viaje.recibir(conteo={linea.id: 2})
+
+        destino = Inventario.objects.get(pk=linea.item_destino_id)
+        entrada = destino.movimientos.get(tipo=MovimientoInventario.TRASLADO_ENTRADA)
+        self.assertEqual(entrada.cantidad, 2)
+
+    def test_no_se_recibe_algo_que_no_salio(self):
+        viaje = self._viaje()
+        viaje.agregar(self.t40, 1)
+        with self.assertRaises(ValueError):
+            viaje.recibir()
+
+    # --- anular ---
+
+    def test_anular_antes_de_salir_devuelve_las_unidades(self):
+        viaje = self._viaje()
+        viaje.agregar(self.t40, 2)
+        viaje.anular('Se rompio la camioneta')
+
+        self.t40.refresh_from_db()
+        self.assertEqual(viaje.estado, Traslado.ANULADO)
+        self.assertEqual(self.t40.disponible, 6)
+        self.assertFalse(self.t40.movimientos.filter(traslado=viaje).exists())
+
+    def test_anular_exige_un_motivo(self):
+        viaje = self._viaje()
+        viaje.agregar(self.t40, 1)
+        with self.assertRaises(ValueError):
+            viaje.anular('  ')
+
+    def test_un_viaje_que_ya_salio_no_se_anula(self):
+        viaje = self._viaje()
+        viaje.agregar(self.t40, 1)
+        viaje.despachar()
+        with self.assertRaises(ValueError):
+            viaje.anular('Tarde')
+
+
+class DisponibilidadTests(_CiudadesMixin, TestCase):
+    """ Que se le promete al cliente en cada mostrador """
+
+    def setUp(self):
+        self._montar_ciudades()
+        self._compra('B018-1', [(self.t40, 4, Decimal('300.00'))], aplicar=True)
+        self.t40.refresh_from_db()
+        self.en_hvca = PuntoRecojo.objects.get(nombre='Tienda GOAT X')
+        self.en_lircay = PuntoRecojo.objects.filter(nombre__icontains='Monetix').first()
+        self.en_lircay.ubicacion = self.lircay
+        self.en_lircay.save(update_fields=['ubicacion'])
+
+    def test_con_stock_en_la_ciudad_se_retira_hoy(self):
+        clave, fecha = para_item(self.t40, 1, self.en_hvca)
+        self.assertEqual(clave, disponibilidad.HOY)
+        self.assertIsNone(fecha)
+
+    def test_todo_reservado_no_es_disponible(self):
+        self.t40.reservar(4)
+        clave, _ = para_item(self.t40, 1, self.en_hvca)
+        self.assertEqual(clave, disponibilidad.SIN_STOCK)
+
+    def test_en_otra_ciudad_sin_transporte_no_se_ofrece(self):
+        clave, fecha = para_item(self.t40, 1, self.en_lircay)
+        self.assertEqual(clave, disponibilidad.SIN_VIAJE)
+        self.assertIsNone(fecha)
+
+    def test_en_otra_ciudad_con_transporte_da_la_fecha(self):
+        viaje = self._viaje()
+        clave, fecha = para_item(self.t40, 1, self.en_lircay)
+
+        self.assertEqual(clave, disponibilidad.ENCARGO)
+        self.assertEqual(fecha, viaje.fecha_disponible)
+
+    def test_manda_el_transporte_que_llega_antes(self):
+        lejano = self._viaje(dias=10)
+        cercano = self._viaje(dias=2)
+        _, fecha = para_item(self.t40, 1, self.en_lircay)
+        self.assertEqual(fecha, cercano.fecha_disponible)
+        self.assertLess(fecha, lejano.fecha_disponible)
+
+    def test_un_producto_que_no_viaja_solo_se_retira_donde_esta(self):
+        self._viaje()
+        categoria = self.variante.producto.categoria
+        categoria.trasladable = False
+        categoria.save(update_fields=['trasladable'])
+
+        self.assertEqual(para_item(self.t40, 1, self.en_hvca)[0], disponibilidad.HOY)
+        self.assertEqual(para_item(self.t40, 1, self.en_lircay)[0], disponibilidad.LEJOS)
+
+    def test_el_producto_puede_pisar_a_su_categoria(self):
+        self._viaje()
+        categoria = self.variante.producto.categoria
+        categoria.trasladable = False
+        categoria.save(update_fields=['trasladable'])
+
+        producto = self.variante.producto
+        producto.trasladable = True                  # la excepcion puntual
+        producto.save(update_fields=['trasladable'])
+
+        self.assertEqual(para_item(self.t40, 1, self.en_lircay)[0], disponibilidad.ENCARGO)
+
+    def test_si_ya_hay_stock_en_destino_se_retira_hoy(self):
+        viaje = self._viaje()
+        viaje.agregar(self.t40, 2)
+        viaje.despachar()
+        viaje.recibir()
+
+        clave, _ = para_item(self.t40, 1, self.en_lircay)
+        self.assertEqual(clave, disponibilidad.HOY)
+
+    # --- el carrito completo ---
+
+    def test_el_carrito_manda_el_peor_caso(self):
+        self._viaje()
+        self._compra('B018-2', [(self.t41, 2, Decimal('300.00'))], aplicar=True)
+        self.t41.refresh_from_db()
+
+        # una linea viaja y la otra no: el pedido entero no se retira alla
+        producto = self.variante.producto
+        producto.trasladable = False
+        producto.save(update_fields=['trasladable'])
+
+        clave, _ = para_carrito([(self.t40, 1), (self.t41, 1)], self.en_lircay)
+        self.assertEqual(clave, disponibilidad.LEJOS)
+
+    def test_el_carrito_toma_la_fecha_mas_lejana(self):
+        cercano = self._viaje(dias=2)
+        self._compra('B018-3', [(self.t41, 2, Decimal('300.00'))], aplicar=True)
+        self.t41.refresh_from_db()
+
+        clave, fecha = para_carrito([(self.t40, 1), (self.t41, 1)], self.en_lircay)
+        self.assertEqual(clave, disponibilidad.ENCARGO)
+        self.assertEqual(fecha, cercano.fecha_disponible)
+
+    def test_todo_en_la_ciudad_es_hoy(self):
+        self._compra('B018-4', [(self.t41, 2, Decimal('300.00'))], aplicar=True)
+        clave, fecha = para_carrito([(self.t40, 1), (self.t41, 1)], self.en_hvca)
+        self.assertEqual(clave, disponibilidad.HOY)
+        self.assertIsNone(fecha)
+
+
+class ModuloTransporteTests(_CiudadesMixin, _VentaMixin, TestCase):
+    """
+    El punto ciego del modulo: sin viaje programado una ciudad deja de ofrecer
+    productos y nadie reclama, porque el cliente no ve un error, ve un catalogo
+    mas chico. Todo esto existe para que eso se vea.
+    """
+
+    def setUp(self):
+        self._montar_ciudades()
+        self._compra('B019-1', [(self.t40, 5, Decimal('300.00'))], aplicar=True)
+        self.t40.refresh_from_db()
+        self.equipo = Client()
+        self.equipo.force_login(
+            User.objects.create_superuser('logistica', 'log@goatx.pe', 'clave-de-prueba')
+        )
+
+    # --- el aviso ---
+
+    def test_una_ciudad_sin_viaje_se_marca(self):
+        self.assertTrue(self.lircay.sin_transporte)
+        self.assertIsNone(self.lircay.proximo_traslado())
+
+    def test_con_viaje_programado_deja_de_avisar(self):
+        viaje = self._viaje()
+        self.assertFalse(self.lircay.sin_transporte)
+        self.assertEqual(self.lircay.proximo_traslado(), viaje)
+
+    def test_el_almacen_principal_nunca_avisa(self):
+        # de Huancavelica sale todo: no hay viaje que la abastezca
+        self.assertFalse(self.huancavelica.sin_transporte)
+
+    def test_un_viaje_ya_recibido_no_cuenta_como_programado(self):
+        viaje = self._viaje()
+        viaje.agregar(self.t40, 1)
+        viaje.despachar()
+        viaje.recibir()
+
+        self.assertTrue(self.lircay.sin_transporte)
+
+    # --- la pantalla ---
+
+    def test_la_pantalla_avisa_la_ciudad_sin_transporte(self):
+        respuesta = self.equipo.get(reverse('web:transportes'))
+        self.assertContains(respuesta, 'Sin transporte programado')
+        self.assertContains(respuesta, 'Lircay')
+        self.assertEqual(len(respuesta.context['sin_transporte']), 1)
+
+    def test_con_viaje_la_pantalla_muestra_las_fechas(self):
+        viaje = self._viaje()
+        respuesta = self.equipo.get(reverse('web:transportes'))
+
+        self.assertEqual(len(respuesta.context['sin_transporte']), 0)
+        self.assertContains(respuesta, viaje.get_estado_display())
+
+    def test_la_pantalla_sirve_para_cualquier_ciudad_nueva(self):
+        """ Pampas o Huancayo entran solas: es una fila, no codigo """
+        Ubicacion.objects.create(nombre='Huancayo', dia_despacho=2, dias_viaje=1)
+
+        respuesta = self.equipo.get(reverse('web:transportes'))
+        self.assertContains(respuesta, 'Huancayo')
+        self.assertEqual(len(respuesta.context['sin_transporte']), 2)
+
+    def test_un_extrano_no_entra(self):
+        self.assertNotEqual(Client().get(reverse('web:transportes')).status_code, 200)
+
+    # --- pedidos esperando viaje ---
+
+    def test_un_pedido_pagado_de_otra_ciudad_queda_esperando(self):
+        punto = PuntoRecojo.objects.filter(nombre__icontains='Monetix').first()
+        punto.ubicacion = self.lircay
+        punto.save(update_fields=['ubicacion'])
+        self._viaje()
+
+        self._agregar(self.t40, 1)
+        self.client.get(reverse('web:continuarComoInvitado'))
+        self.client.post(reverse('web:registrarPedido'), dict(
+            DATOS_CHECKOUT, modo_entrega='R', punto_recojo=punto.id
+        ))
+        pedido = Pedido.objects.latest('id')
+        self._avanzar(pedido, Pedido.PAGADO)
+
+        esperando = Traslado.pedidos_esperando(destino=self.lircay)
+        self.assertEqual(len(esperando), 1)
+        self.assertEqual(esperando[0][0], pedido)
+
+    def test_lo_que_ya_esta_en_un_viaje_deja_de_esperar(self):
+        punto = PuntoRecojo.objects.filter(nombre__icontains='Monetix').first()
+        punto.ubicacion = self.lircay
+        punto.save(update_fields=['ubicacion'])
+        viaje = self._viaje()
+
+        self._agregar(self.t40, 1)
+        self.client.get(reverse('web:continuarComoInvitado'))
+        self.client.post(reverse('web:registrarPedido'), dict(
+            DATOS_CHECKOUT, modo_entrega='R', punto_recojo=punto.id
+        ))
+        pedido = Pedido.objects.latest('id')
+        self._avanzar(pedido, Pedido.PAGADO)
+
+        detalle = pedido.detalles.get()
+        viaje.agregar(detalle.item, detalle.cantidad,
+                      motivo=TrasladoDetalle.POR_PEDIDO, pedido=pedido)
+
+        self.assertEqual(Traslado.pedidos_esperando(destino=self.lircay), [])
+
+    def test_un_pedido_de_su_propia_ciudad_no_espera_nada(self):
+        punto = PuntoRecojo.objects.get(nombre='Tienda GOAT X')
+        self._agregar(self.t40, 1)
+        self.client.get(reverse('web:continuarComoInvitado'))
+        self.client.post(reverse('web:registrarPedido'), dict(
+            DATOS_CHECKOUT, modo_entrega='R', punto_recojo=punto.id
+        ))
+        self._avanzar(Pedido.objects.latest('id'), Pedido.PAGADO)
+
+        self.assertEqual(Traslado.pedidos_esperando(), [])
+
+    # --- el comando ---
+
+    def test_el_comando_simula_sin_crear_nada(self):
+        salida = StringIO()
+        call_command('programar_transportes', '--simular', stdout=salida)
+
+        self.assertIn('SIN TRANSPORTE PROGRAMADO', salida.getvalue())
+        self.assertEqual(Traslado.objects.count(), 0)
+
+    def test_el_comando_programa_el_viaje_que_falta(self):
+        salida = StringIO()
+        call_command('programar_transportes', stdout=salida)
+
+        viaje = self.lircay.proximo_traslado()
+        self.assertIsNotNone(viaje)
+        self.assertEqual(viaje.origen, self.huancavelica)
+        self.assertEqual(viaje.unidades, 0)          # nace vacio: no compromete nada
+        self.assertEqual(viaje.fecha_disponible, self.lircay.llegada_de(viaje.fecha_despacho))
+
+    def test_el_comando_no_duplica_lo_que_ya_esta(self):
+        self._viaje()
+        call_command('programar_transportes', stdout=StringIO())
+        self.assertEqual(Traslado.objects.count(), 1)
+
+    def test_sin_ciudades_pendientes_lo_dice(self):
+        self._viaje()
+        salida = StringIO()
+        call_command('programar_transportes', stdout=salida)
+        self.assertIn('Todas las ciudades tienen su viaje', salida.getvalue())

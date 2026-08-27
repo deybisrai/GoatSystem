@@ -16,9 +16,14 @@ from .catalogo import (
     Variante,
 )
 from .clientes import Cliente
-from .compras import Compra, CompraDetalle, Proveedor
+from .entregas import PuntoRecojo
+from .compras import Compra, CompraBloqueada, CompraDetalle, Proveedor
 from .inventario import Inventario
+from .kardex import MovimientoInventario
+from .pagos import CuentaRecaudadora, Pago
 from .promociones import Campana, Cupon
+from .traslados import Traslado, TrasladoDetalle
+from .ubicaciones import Ubicacion
 from .ventas import Pedido, PedidoDetalle
 
 __all__ = [
@@ -28,15 +33,23 @@ __all__ = [
     'Cliente',
     'Color',
     'Compra',
+    'CompraBloqueada',
     'CompraDetalle',
+    'CuentaRecaudadora',
     'Cupon',
     'Curva',
     'Inventario',
+    'MovimientoInventario',
+    'Pago',
     'Pedido',
     'PedidoDetalle',
     'Producto',
     'ProductoVisibleManager',
     'Proveedor',
+    'PuntoRecojo',
+    'Traslado',
+    'TrasladoDetalle',
+    'Ubicacion',
     'ValorAtributo',
     'Variante',
 ]

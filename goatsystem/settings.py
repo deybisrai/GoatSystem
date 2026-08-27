@@ -131,3 +131,38 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 MEDIA_ROOT = os.path.join(BASE_DIR,'media')
 MEDIA_URL = '/media/'
+
+# Archivos que NUNCA se sirven por URL. Todo lo que esta bajo MEDIA_ROOT lo
+# entrega Django en desarrollo y Nginx en produccion a cualquiera que adivine la
+# ruta, sin pasar por ningun permiso. Los comprobantes de pago llevan datos
+# bancarios del cliente, asi que viven aca y solo salen por una vista que revisa
+# quien esta pidiendo.
+PRIVADO_ROOT = os.path.join(BASE_DIR, 'privado')
+
+# Cuanto le guardamos el producto al cliente mientras va a pagar.
+# Corto de mas es peor que largo de mas: si vence a mitad de la transferencia,
+# el cliente ya movio plata y hay que devolversela. Contar lo que tiene que
+# hacer -- abrir Yape, escanear, confirmar, sacar captura, volver y subirla --
+# son 4 o 5 minutos para alguien agil, y 10 con transferencia bancaria.
+MINUTOS_RESERVA = 15
+
+# Lo que le prometemos al cliente: en cuanto confirmamos su pago.
+#
+# Este plazo NO es simetrico con el de arriba, y es a proposito. Los 15 minutos
+# son plazo del cliente: todavia no pago, y si no cumple soltamos la unidad sin
+# que le cueste nada. Estas horas son plazo NUESTRO: el cliente ya transfirio,
+# ya hizo su parte, y soltarle la unidad seria castigarlo por nuestra demora.
+# Por eso el de despues es mas largo: no es una fecha limite para el, es una red
+# por si nos trabamos.
+HORAS_VALIDACION = 12
+
+# Y a las cuantas horas la bandeja lo marca como demorado. Es la alarma interna,
+# la mitad del plazo prometido, para llegar a tiempo y no enterarse tarde.
+HORAS_ALERTA_VALIDACION = 6
+
+# A quien se le avisa cuando llega un comprobante. En desarrollo el correo sale
+# por consola; el SMTP real se configura en la fase 8, que igual hace falta para
+# escribirle al cliente.
+EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+DEFAULT_FROM_EMAIL = 'GOAT X <no-responder@goatx.pe>'
+CORREOS_AVISO = ['deybis.cc@hotmail.com']

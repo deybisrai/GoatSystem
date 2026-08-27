@@ -1,0 +1,75 @@
+{% extends "admin/base_site.html" %}
+
+{% comment %}
+Recibir es contar, no aceptar. La pantalla no trae los numeros cargados a
+proposito: quien recibe escribe lo que ve en la caja. Si coincide, coincide; y
+si no, la diferencia queda escrita con nombre y fecha.
+{% endcomment %}
+
+{% block content %}
+<h1>Recibir traslados</h1>
+
+<p>
+    Abri la caja y conta. <b>Escribi lo que llego</b>, no lo que dice el papel:
+    si los numeros no coinciden, ya sabes entre que dos personas se perdio.
+</p>
+
+<form method="post">
+    {% csrf_token %}
+    {% for id in seleccionadas %}
+        <input type="hidden" name="_selected_action" value="{{ id }}">
+    {% endfor %}
+    <input type="hidden" name="action" value="{{ accion }}">
+
+    {% for viaje in viajes %}
+    <div class="rt-viaje">
+        <h2>{{ viaje }}</h2>
+        <p class="rt-meta">
+            Salio el {{ viaje.fecha_despacho|date:"d/m/Y" }} &middot;
+            esperado el {{ viaje.fecha_disponible|date:"d/m/Y" }}
+        </p>
+
+        <table class="rt-tabla">
+            <thead>
+                <tr><th>Producto</th><th>Motivo</th><th>Enviadas</th><th>Llegaron</th></tr>
+            </thead>
+            <tbody>
+                {% for detalle in viaje.detalles.all %}
+                <tr>
+                    <td>{{ detalle.item }}</td>
+                    <td>{{ detalle.get_motivo_display }}{% if detalle.pedido %} &middot; {{ detalle.pedido.nro_pedido }}{% endif %}</td>
+                    <td class="rt-num">{{ detalle.cantidad }}</td>
+                    <td>
+                        <input type="number" name="llegaron-{{ detalle.id }}"
+                               min="0" max="{{ detalle.cantidad }}" value="" required>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% empty %}
+    <p>Ninguno de los traslados elegidos esta en transito.</p>
+    {% endfor %}
+
+    <p>
+        <input type="submit" name="aplicar" value="Confirmar la recepcion" class="default">
+        <a href="../" class="button" style="margin-left:8px">Volver</a>
+    </p>
+</form>
+
+<style>
+    .rt-viaje { padding: 16px 0; border-bottom: 1px solid #e0e0e0; }
+    .rt-viaje h2 { margin: 0 0 4px; font-size: 17px; }
+    .rt-meta { margin: 0 0 12px; color: #666; font-size: 13px; }
+    .rt-tabla { border-collapse: collapse; }
+    .rt-tabla th {
+        text-align: left; font-weight: 400; color: #666; font-size: 12px;
+        text-transform: uppercase; letter-spacing: .04em;
+        padding: 4px 18px 4px 0; border-bottom: 1px solid #e0e0e0;
+    }
+    .rt-tabla td { padding: 7px 18px 7px 0; }
+    .rt-num { font-variant-numeric: tabular-nums; }
+    .rt-tabla input[type="number"] { width: 80px; padding: 5px 7px; font-size: 15px; }
+</style>
+{% endblock %}

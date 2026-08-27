@@ -5,8 +5,15 @@
 
     <div class="resumen-inventario">
         <div class="resumen-caja">
-            <p class="resumen-label">Unidades en stock</p>
+            <p class="resumen-label">Unidades en el estante</p>
             <p class="resumen-valor">{{ total_unidades }}</p>
+        </div>
+        <div class="resumen-caja">
+            <p class="resumen-label">A la venta</p>
+            <p class="resumen-valor">
+                {{ total_a_la_venta }}
+                {% if total_reservadas %}<span class="resumen-nota">({{ total_reservadas }} reservadas)</span>{% endif %}
+            </p>
         </div>
         <div class="resumen-caja">
             <p class="resumen-label">Costo de mercaderia</p>

@@ -27,5 +27,10 @@ urlpatterns = [
     path('identificarse', views.identificarse, name='identificarse'),
     path('continuarComoInvitado', views.continuarComoInvitado, name='continuarComoInvitado'),
     path('registrarPedido', views.registrarPedido, name='registrarPedido'),
+    path('pago', views.pagoPedido, name='pagoPedido'),
+    path('voucher/<int:pago_id>', views.voucherPago, name='voucherPago'),
+    path('validar', views.validarPagos, name='validarPagos'),
+    path('transportes', views.transportes, name='transportes'),
+    path('validar/<int:pago_id>', views.validarPago, name='validarPago'),
     path('gracias', views.gracias, name='gracias'),
 ]

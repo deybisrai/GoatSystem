@@ -8,6 +8,18 @@
         Te escribiremos a <b>{{ pedido.email_comprador }}</b> para coordinar la entrega.
     </p>
 
+    {% if pedido.pago_pendiente %}
+    <p class="gracias-estado">
+        Estamos verificando tu comprobante contra nuestra cuenta.
+        Apenas quede confirmado preparamos tu envio.
+    </p>
+    {% elif pedido.estado == '0' %}
+    <p class="gracias-estado gracias-pendiente">
+        Todavia no recibimos tu comprobante.
+        <a href="{% url 'web:pagoPedido' %}">Registrar mi pago</a>
+    </p>
+    {% endif %}
+
     <div class="gracias-caja">
         <h2>Detalle del pedido</h2>
         <ul class="gracias-items">
@@ -29,12 +41,24 @@
         </div>
         {% endif %}
         <div class="gracias-total">
-            <span>Total pagado</span>
+            <span>Total a pagar</span>
             <b>s/{{ pedido.monto_total }}</b>
         </div>
     </div>
 
     <div class="gracias-caja">
+        {% if pedido.es_recojo %}
+        <h2>Recojo en tienda</h2>
+        <p class="gracias-envio">
+            <b>{{ pedido.punto_recojo_nombre }}</b><br>
+            {{ pedido.punto_recojo_direccion }}<br>
+            {% if pedido.punto_recojo.horario %}{{ pedido.punto_recojo.horario }}<br>{% endif %}
+            A nombre de {{ pedido.nombre_comprador }} {{ pedido.apellido_comprador }}
+        </p>
+        <p class="gracias-envio" style="color:#8c8c8c;font-size:14px">
+            Te avisamos apenas este listo para recoger. Lleva tu DNI.
+        </p>
+        {% else %}
         <h2>Envio</h2>
         <p class="gracias-envio">
             {{ pedido.nombre_comprador }} {{ pedido.apellido_comprador }}<br>
@@ -42,6 +66,7 @@
             {{ pedido.distrito_envio }}, {{ pedido.provincia_envio }}, {{ pedido.departamento_envio }}<br>
             Telefono: {{ pedido.telefono_envio }}
         </p>
+        {% endif %}
     </div>
 
     <a href="{% url 'web:index' %}" class="button">Seguir comprando</a>
@@ -67,7 +92,18 @@
         line-height: 1;
     }
     .gracias h1 { margin: 0 0 10px; }
-    .gracias-sub { color: #6a6a6a; margin: 0 0 28px; }
+    .gracias-sub { color: #6a6a6a; margin: 0 0 18px; }
+    .gracias-estado {
+        background: #fff;
+        border: 1px solid #e6e6e6;
+        border-left: 3px solid #3e7a4c;
+        border-radius: 4px;
+        padding: 13px 18px;
+        margin: 0 0 28px;
+        text-align: left;
+        line-height: 1.6;
+    }
+    .gracias-pendiente { border-left-color: #b5541b; }
 
     .gracias-caja {
         background: #fff;

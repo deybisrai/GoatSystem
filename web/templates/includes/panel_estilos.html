@@ -1,0 +1,167 @@
+{% comment %}
+Estilos del panel interno: validacion de pagos y estado del transporte.
+
+Va aparte del theme de la tienda a proposito: son herramientas que se usan desde
+el celular, y cargarles doce hojas de estilo de un tema de ecommerce solo las
+haria mas lentas.
+{% endcomment %}
+<style>
+    * { box-sizing: border-box; }
+    body {
+        margin: 0;
+        font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+        font-size: 16px;
+        line-height: 1.5;
+        color: #1f1f1f;
+        background: #f4f4f2;
+        -webkit-font-smoothing: antialiased;
+    }
+    a { color: inherit; text-decoration: none; }
+
+    .vp-head {
+        display: flex; align-items: center; gap: 10px;
+        padding: 12px 16px;
+        background: #1f1f1f; color: #fff;
+        position: sticky; top: 0; z-index: 10;
+    }
+    .vp-marca { font-weight: 700; letter-spacing: .04em; font-size: 15px; }
+    .vp-titulo { flex: 1 1 auto; font-size: 14px; color: #cfcfcf; }
+    .vp-cuenta {
+        min-width: 26px; padding: 2px 8px; border-radius: 12px;
+        background: #3a3a3a; font-size: 13px; font-weight: 600; text-align: center;
+    }
+    .vp-cuenta.vp-hay { background: #b5541b; }
+
+    .vp-main { max-width: 720px; margin: 0 auto; padding: 16px; }
+
+    .vp-aviso {
+        margin: 0 0 14px; padding: 12px 14px;
+        background: #fff; border-left: 3px solid #3e7a4c; border-radius: 4px;
+        font-size: 14px;
+    }
+    .vp-aviso-error { border-left-color: #b5541b; }
+
+    .vp-nota {
+        margin: 0 0 14px; color: #6a6a6a; font-size: 13.5px; line-height: 1.6;
+    }
+
+    .vp-vacio { text-align: center; padding: 60px 20px; color: #6a6a6a; }
+    .vp-vacio-check {
+        width: 56px; height: 56px; margin: 0 auto 14px;
+        display: flex; align-items: center; justify-content: center;
+        border-radius: 50%; background: #e6f2e9; color: #3e7a4c; font-size: 28px;
+    }
+    .vp-vacio p { margin: 4px 0; }
+    .vp-vacio-sub { font-size: 14px; max-width: 34ch; margin: 8px auto 0; }
+
+    .vp-lista { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+    .vp-item {
+        display: flex; align-items: center; gap: 12px;
+        padding: 12px 14px;
+        background: #fff; border: 1px solid #e6e6e6; border-radius: 6px;
+    }
+    .vp-item:active { background: #f6f6f6; }
+    .vp-demorado { border-left: 3px solid #b5541b; }
+
+    .vp-thumb {
+        flex: 0 0 auto; width: 54px; height: 54px;
+        border-radius: 4px; overflow: hidden; background: #eee;
+    }
+    .vp-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+    .vp-datos { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+    .vp-pedido { font-size: 15px; }
+    .vp-cliente { font-size: 13.5px; color: #4a4a4a; }
+    .vp-meta {
+        font-size: 12.5px; color: #8c8c8c;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .vp-tarde { font-size: 12px; color: #b5541b; font-weight: 600; }
+
+    .vp-derecha { flex: 0 0 auto; text-align: right; display: flex; flex-direction: column; }
+    .vp-monto { font-size: 16px; font-variant-numeric: tabular-nums; }
+    .vp-espera { font-size: 12.5px; color: #8c8c8c; font-variant-numeric: tabular-nums; }
+    .vp-demorado .vp-espera { color: #b5541b; font-weight: 600; }
+
+    /* ---------- transporte ---------- */
+    .tr-ciudad {
+        background: #fff; border: 1px solid #e6e6e6; border-radius: 6px;
+        padding: 14px 16px; margin-bottom: 10px;
+    }
+    .tr-ciudad.tr-alerta { border-left: 3px solid #b5541b; }
+    .tr-cab { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    .tr-nombre { font-size: 16px; font-weight: 600; }
+    .tr-estado { font-size: 13px; }
+    .tr-ok { color: #3e7a4c; }
+    .tr-mal { color: #b5541b; font-weight: 600; }
+    .tr-detalle { margin: 8px 0 0; color: #6a6a6a; font-size: 13.5px; line-height: 1.6; }
+    .tr-espera {
+        display: inline-block; margin-top: 8px; padding: 3px 9px;
+        background: #fdf6e9; border-radius: 3px; color: #7d6216; font-size: 12.5px;
+    }
+    .tr-lista { list-style: none; margin: 8px 0 0; padding: 0; font-size: 13px; color: #4a4a4a; }
+    .tr-lista li { padding: 3px 0; }
+
+    /* ---------- detalle ---------- */
+    .vd-caja {
+        background: #fff; border: 1px solid #e6e6e6; border-radius: 6px;
+        padding: 16px; margin-bottom: 14px;
+    }
+    .vd-voucher { text-align: center; }
+    .vd-voucher img {
+        max-width: 100%; height: auto; border-radius: 4px; border: 1px solid #eee;
+    }
+    .vd-voucher-nota { margin: 10px 0 0; font-size: 12.5px; color: #8c8c8c; }
+
+    .vd-datos { margin: 0; }
+    .vd-datos > div {
+        display: flex; justify-content: space-between; align-items: baseline; gap: 14px;
+        padding: 9px 0; border-bottom: 1px solid #f0f0f0;
+    }
+    .vd-datos > div:last-child { border-bottom: 0; }
+    .vd-datos dt { color: #8c8c8c; font-size: 13px; }
+    .vd-datos dd { margin: 0; font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
+    .vd-total dd { font-size: 19px; }
+
+    .vd-recordatorio {
+        background: #fdf6e9; border: 1px solid #efdfc0; border-left: 3px solid #97711a;
+        border-radius: 4px; padding: 12px 14px; margin-bottom: 14px;
+        font-size: 13.5px; color: #7d6216; line-height: 1.6;
+    }
+
+    .vd-campo { margin-bottom: 12px; }
+    .vd-campo label { display: block; margin-bottom: 5px; font-size: 14px; font-weight: 600; }
+    .vd-campo small { display: block; margin-top: 5px; color: #8c8c8c; font-size: 12.5px; }
+    .vd-campo input[type="number"], .vd-campo textarea {
+        width: 100%; padding: 12px; font-size: 17px;
+        border: 1px solid #ddd; border-radius: 5px; background: #fff;
+        font-family: inherit;
+    }
+    .vd-campo input:focus, .vd-campo textarea:focus { border-color: #1f1f1f; outline: none; }
+    .vd-error { margin: 6px 0 0; color: #b5541b; font-size: 13px; }
+
+    .vd-boton {
+        width: 100%; padding: 14px; border: 0; border-radius: 5px;
+        font-size: 16px; font-weight: 600; cursor: pointer;
+    }
+    .vd-validar { background: #3e7a4c; color: #fff; }
+    .vd-rechazar { background: #fff; color: #b5541b; border: 1px solid #e0c3b1; }
+
+    .vd-resuelto {
+        background: #fff; border: 1px solid #e6e6e6; border-left: 3px solid #3e7a4c;
+        border-radius: 6px; padding: 16px; margin-bottom: 14px; font-size: 14px;
+    }
+
+    .vd-volver { display: block; text-align: center; padding: 16px; color: #6a6a6a; font-size: 14px; }
+
+    details.vd-otro { margin-top: 10px; }
+    details.vd-otro > summary {
+        cursor: pointer; padding: 12px; text-align: center;
+        color: #8c8c8c; font-size: 14px;
+    }
+
+    @media (min-width: 640px) {
+        .vd-cuerpo { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
+        .vd-cuerpo > * { margin-bottom: 0; }
+    }
+</style>

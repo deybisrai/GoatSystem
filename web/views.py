@@ -1,13 +1,20 @@
+from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import authenticate, login, logout
+from django.contrib.admin.views.decorators import staff_member_required
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
-from django.http import JsonResponse
+from django.http import FileResponse, Http404, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.utils import timezone
 
 from .carrito import Cart
-from .forms import ClienteForm, PedidoForm
-from .models import Categoria, Cliente, Pedido, Variante, Inventario
+from .disponibilidad import para_carrito
+from .forms import ClienteForm, PagoForm, PedidoForm, RechazoForm, ValidacionForm
+from .models import (
+    Categoria, Cliente, CuentaRecaudadora, Inventario, Pago, Pedido, PuntoRecojo,
+    Traslado, Ubicacion, Variante,
+)
 from .pedidos import PedidoError, crear_pedido
 
 """ VISTAS PARA EL CATALOGO DE PRODUCTOS """
@@ -354,8 +361,10 @@ def registrarPedido(request):
     if not request.user.is_authenticated and not request.session.get(CLAVE_INVITADO):
         return redirect('web:identificarse')
 
+    puntos = PuntoRecojo.objects.filter(activo=True)
+
     if request.method == 'POST':
-        frmPedido = PedidoForm(request.POST)
+        frmPedido = PedidoForm(request.POST, puntos=puntos)
         if frmPedido.is_valid():
             try:
                 pedido = crear_pedido(carrito_actual, frmPedido.cleaned_data, request.user)
@@ -366,17 +375,224 @@ def registrarPedido(request):
             carrito_actual.clear()
             request.session.pop(CLAVE_INVITADO, None)
             request.session['ultimo_pedido'] = pedido.id
-            return redirect('web:gracias')
+            return redirect('web:pagoPedido')
 
         messages.error(request, 'Revisa los datos marcados en el formulario')
     else:
-        frmPedido = PedidoForm(initial=_datos_pedido(request.user))
+        frmPedido = PedidoForm(initial=_datos_pedido(request.user), puntos=puntos)
+
+    # que se le puede prometer en cada mostrador, con el carrito que trae
+    lineas = [
+        (item, next(l['cantidad'] for l in carrito_actual if l['item_id'] == item.id))
+        for item in Inventario.objects.filter(
+            id__in=[l['item_id'] for l in carrito_actual]
+        ).select_related('variante__producto__categoria', 'ubicacion')
+    ]
+    ofertas = []
+    for punto in puntos.select_related('ubicacion'):
+        clave, fecha = para_carrito(lineas, punto)
+        ofertas.append({'punto': punto, 'clave': clave, 'fecha': fecha})
 
     context = {
         'frmPedido': frmPedido,
         'carrito': carrito_actual,
+        'puntos': puntos,
+        'ofertas': ofertas,
     }
     return render(request, 'pedido.html', context)
+
+
+def pagoPedido(request):
+    """
+    Donde el cliente ve nuestras cuentas y declara su pago.
+
+    Lee el pedido de la sesion, igual que gracias(), para no exponerlo en la URL.
+    Nada de lo que llega aca se da por cobrado: el pedido pasa a "En validacion"
+    y alguien lo confirma despues mirando la cuenta real.
+    """
+    pedido_id = request.session.get('ultimo_pedido')
+    if not pedido_id:
+        return redirect('web:index')
+
+    pedido = get_object_or_404(
+        Pedido.objects.prefetch_related('detalles', 'pagos'), pk=pedido_id
+    )
+    if pedido.descontado:
+        return redirect('web:gracias')
+
+    # si el reloj se paso mientras el cliente miraba la pantalla, se cierra aca
+    # y las unidades vuelven a la venta. El cliente igual puede mandar su
+    # comprobante: si ya transfirio, lo peor seria no dejarlo avisar.
+    if pedido.reserva_vencida:
+        pedido.cancelar('Vencio el plazo para pagar')
+        pedido.refresh_from_db()
+
+    cuentas = CuentaRecaudadora.objects.filter(activo=True)
+    if not cuentas.exists():
+        messages.error(request, 'No hay cuentas de pago configuradas. Escribenos para coordinar.')
+        return redirect('web:gracias')
+
+    pendiente = pedido.pago_pendiente
+
+    if request.method == 'POST' and pendiente is None:
+        frmPago = PagoForm(request.POST, request.FILES, cuentas=cuentas)
+        if frmPago.is_valid():
+            datos = frmPago.cleaned_data
+            pedido.declarar_pago(
+                cuenta=datos['cuenta'],
+                monto_declarado=datos['monto_declarado'],
+                nro_operacion=datos['nro_operacion'],
+                voucher=datos['voucher'],
+                fecha_pago=datos['fecha_pago'],
+                base_url=request.build_absolute_uri('/').rstrip('/'),
+            )
+            messages.success(request, 'Recibimos tu comprobante. Lo estamos revisando.')
+            return redirect('web:gracias')
+
+        messages.error(request, 'Revisa los datos marcados del comprobante')
+    else:
+        frmPago = PagoForm(
+            cuentas=cuentas,
+            initial={
+                'monto_declarado': pedido.monto_total,
+                'fecha_pago': timezone.localdate(),
+                'cuenta': cuentas.first(),
+            },
+        )
+
+    return render(request, 'pago.html', {
+        'pedido': pedido,
+        'cuentas': cuentas,
+        'frmPago': frmPago,
+        'pendiente': pendiente,
+        'rechazo': pedido.ultimo_rechazo,
+        'vencido': pedido.estado == Pedido.CANCELADO,
+        'segundos': pedido.segundos_restantes if pedido.estado == Pedido.SOLICITADO else None,
+    })
+
+
+@staff_member_required
+def transportes(request):
+    """
+    El estado del transporte entre ciudades.
+
+    Existe por el punto ciego del modulo: sin viaje programado una ciudad deja de
+    ofrecer productos y nadie reclama, porque el cliente no ve un error, ve un
+    catalogo mas chico. Aca se ve de un vistazo, y sirve igual con dos ciudades
+    que con cinco.
+    """
+    ciudades = []
+    for ubicacion in Ubicacion.objects.filter(activo=True).exclude(es_principal=True):
+        viaje = ubicacion.proximo_traslado()
+        ciudades.append({
+            'ubicacion': ubicacion,
+            'viaje': viaje,
+            'sin_viaje': viaje is None,
+            'esperando': Traslado.pedidos_esperando(destino=ubicacion),
+            'unidades': sum(i.stock for i in ubicacion.items.all()),
+            'puntos': ubicacion.puntos.filter(activo=True).count(),
+        })
+
+    return render(request, 'transportes.html', {
+        'ciudades': ciudades,
+        'sin_transporte': [c for c in ciudades if c['sin_viaje']],
+    })
+
+
+@staff_member_required
+def validarPagos(request):
+    """
+    La cola de comprobantes por revisar, hecha para el celular.
+
+    Existe por una razon concreta: la notificacion de Yape llega al telefono, y
+    si validar exige sentarse frente a una computadora el pago se confirma horas
+    despues. Aca se confirma donde uno esta.
+    """
+    pendientes = (
+        Pago.objects
+        .filter(estado=Pago.PENDIENTE)
+        .select_related('pedido', 'cuenta')
+        .order_by('creado')
+    )
+    return render(request, 'validar.html', {
+        'pendientes': pendientes,
+        'horas_promesa': settings.HORAS_VALIDACION,
+    })
+
+
+@staff_member_required
+def validarPago(request, pago_id):
+    """
+    Un comprobante: el voucher grande, los datos al lado, y dos botones.
+
+    Validar sigue exigiendo escribir el monto que se vio en la cuenta. Esa es la
+    friccion que importa y no se saca; la que se saca es la de navegar.
+    """
+    pago = get_object_or_404(
+        Pago.objects.select_related('pedido', 'cuenta'), pk=pago_id
+    )
+
+    frmValidar, frmRechazar = ValidacionForm(), RechazoForm()
+
+    if request.method == 'POST' and pago.estado == Pago.PENDIENTE:
+        if 'validar' in request.POST:
+            frmValidar = ValidacionForm(request.POST)
+            if frmValidar.is_valid():
+                try:
+                    pago.validar(frmValidar.cleaned_data['monto_confirmado'], usuario=request.user)
+                except ValueError as problema:
+                    messages.error(request, str(problema))
+                else:
+                    if pago.cuadra:
+                        messages.success(request, f'{pago.pedido.nro_pedido} confirmado.')
+                    else:
+                        messages.error(
+                            request,
+                            f'{pago.pedido.nro_pedido} quedo con una diferencia de '
+                            f'{pago.diferencia:+.2f} contra el total del pedido.'
+                        )
+                    return redirect('web:validarPagos')
+
+        elif 'rechazar' in request.POST:
+            frmRechazar = RechazoForm(request.POST)
+            if frmRechazar.is_valid():
+                try:
+                    pago.rechazar(frmRechazar.cleaned_data['motivo'], usuario=request.user)
+                except ValueError as problema:
+                    messages.error(request, str(problema))
+                else:
+                    messages.success(request, 'Comprobante rechazado. El cliente puede enviar otro.')
+                    return redirect('web:validarPagos')
+
+    return render(request, 'validar_detalle.html', {
+        'pago': pago,
+        'pedido': pago.pedido,
+        'frmValidar': frmValidar,
+        'frmRechazar': frmRechazar,
+    })
+
+
+def voucherPago(request, pago_id):
+    """
+    Entrega la imagen del comprobante.
+
+    No puede vivir suelta en /media/: un voucher es el pantallazo bancario del
+    cliente, con su nombre y sus montos. Cualquiera con la URL lo leeria. Se
+    entrega solo al staff y a quien hizo ese pedido, y si no corresponde se
+    responde 404 y no 403, para no confirmar siquiera que existe.
+    """
+    pago = get_object_or_404(Pago.objects.select_related('pedido__cliente'), pk=pago_id)
+    pedido = pago.pedido
+
+    es_duenno = (
+        request.user.is_staff
+        or (pedido.cliente_id and pedido.cliente.usuario_id == request.user.id)
+        or request.session.get('ultimo_pedido') == pedido.id
+    )
+    if not es_duenno or not pago.voucher:
+        raise Http404
+
+    return FileResponse(pago.voucher.open('rb'), content_type='image/*')
 
 
 def gracias(request):

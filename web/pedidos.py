@@ -5,10 +5,13 @@ Vive aparte de views.py porque el punto de venta (app pos) va a necesitar
 exactamente esta misma logica de descuento de stock.
 """
 
+from datetime import timedelta
 from decimal import Decimal
 from uuid import uuid4
 
+from django.conf import settings
 from django.db import transaction
+from django.utils import timezone
 
 from .models import Cliente, Cupon, Pedido, PedidoDetalle, Inventario
 
@@ -27,10 +30,14 @@ def _sufijo(linea):
 @transaction.atomic
 def crear_pedido(carrito, datos, usuario=None):
     """
-    Crea el Pedido con sus detalles y descuenta el inventario.
+    Crea el Pedido con sus detalles y RESERVA el inventario.
+
+    Reservar no descuenta: las unidades quedan comprometidas y dejan de ofrecerse,
+    pero siguen en el almacen hasta que alguien valide el pago. El pedido nace con
+    un plazo (MINUTOS_RESERVA) y, si vence sin pagar, las suelta.
 
     Todo ocurre dentro de una transaccion con las filas de inventario bloqueadas
-    (select_for_update), para que dos clientes no puedan comprar la ultima unidad
+    (select_for_update), para que dos clientes no puedan reservar la ultima unidad
     al mismo tiempo. Si algo falla, no se guarda nada.
     """
     lineas = list(carrito)
@@ -38,6 +45,12 @@ def crear_pedido(carrito, datos, usuario=None):
         raise PedidoError('Tu carrito esta vacio')
 
     ids = [linea['item_id'] for linea in lineas]
+
+    # antes de mirar si hay stock se sueltan las reservas que se pasaron de plazo.
+    # Asi el sistema se corrige solo aunque nadie haya programado el comando: las
+    # unidades se liberan justo cuando alguien las necesita.
+    Pedido.vencer_reservas(items=ids)
+
     inventario = {
         item.id: item
         for item in (
@@ -52,6 +65,8 @@ def crear_pedido(carrito, datos, usuario=None):
     if usuario is not None and usuario.is_authenticated:
         cliente = Cliente.objects.filter(usuario=usuario).first()
 
+    punto = datos.get('punto_recojo') if datos.get('modo_entrega') == Pedido.RECOJO else None
+
     pedido = Pedido.objects.create(
         cliente=cliente,
         nro_pedido=uuid4().hex[:20],          # provisional, se reemplaza abajo
@@ -60,12 +75,19 @@ def crear_pedido(carrito, datos, usuario=None):
         email_comprador=datos['email'],
         telefono_comprador=datos['telefono'],
         dni_comprador=datos.get('dni', ''),
-        direccion_envio=datos['direccion'],
+        modo_entrega=datos.get('modo_entrega', Pedido.ENVIO),
+        direccion_envio=datos.get('direccion', ''),
         referencia_envio=datos.get('referencia', ''),
-        distrito_envio=datos['distrito'],
-        provincia_envio=datos['provincia'],
-        departamento_envio=datos['departamento'],
+        distrito_envio=datos.get('distrito', ''),
+        provincia_envio=datos.get('provincia', ''),
+        departamento_envio=datos.get('departamento', ''),
         telefono_envio=datos['telefono'],
+        punto_recojo=punto,
+        # copia, no referencia: si manana cierra esa agencia, el pedido de ayer
+        # tiene que seguir diciendo donde se retiro
+        punto_recojo_nombre=punto.nombre if punto else '',
+        punto_recojo_direccion=punto.direccion_completa if punto else '',
+        reserva_vence=timezone.now() + timedelta(minutes=settings.MINUTOS_RESERVA),
     )
 
     monto_total = Decimal('0')
@@ -81,9 +103,12 @@ def crear_pedido(carrito, datos, usuario=None):
         nombre_item = f'{item.variante.producto.nombre} ({item.variante.color}{_sufijo(linea)})'
 
         cantidad = linea['cantidad']
-        if cantidad > item.stock:
-            disponible = 'no queda ninguna unidad' if item.stock == 0 else f'solo quedan {item.stock}'
-            raise PedidoError(f'De {nombre_item} {disponible}. Ajusta tu carrito.')
+        if cantidad > item.disponible:
+            cuantas = (
+                'no queda ninguna unidad' if item.disponible == 0
+                else f'solo quedan {item.disponible}'
+            )
+            raise PedidoError(f'De {nombre_item} {cuantas}. Ajusta tu carrito.')
 
         # el precio manda desde la base de datos, no desde la sesion del navegador
         precio = item.precio_final()
@@ -107,7 +132,9 @@ def crear_pedido(carrito, datos, usuario=None):
             subtotal=subtotal,
         )
 
-        item.descontar_stock(cantidad)
+        # se reserva, no se descuenta: el par sigue en el estante hasta que el
+        # pago se valide. El kardex no registra promesas, solo movimientos reales.
+        item.reservar(cantidad)
 
     # el cupon se revalida aqui: pudo vencer o agotarse mientras el cliente compraba.
     # si dejo de aplicar, se detiene la venta en vez de cobrar mas de lo que el cliente vio.

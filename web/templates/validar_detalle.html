@@ -1,0 +1,140 @@
+{% load static %}<!doctype html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ pedido.nro_pedido }} - Validar pago</title>
+    {% include 'includes/panel_estilos.html' %}
+</head>
+<body>
+
+<header class="vp-head">
+    <a class="vp-marca" href="{% url 'web:validarPagos' %}">&larr;</a>
+    <span class="vp-titulo">{{ pedido.nro_pedido }}</span>
+    <span class="vp-cuenta {% if pago.demorado %}vp-hay{% endif %}">{{ pago.espera }}</span>
+</header>
+
+<main class="vp-main">
+    {% if messages %}
+        {% for message in messages %}
+        <p class="vp-aviso {% if message.tags == 'error' %}vp-aviso-error{% endif %}">{{ message }}</p>
+        {% endfor %}
+    {% endif %}
+
+    {% if pago.estado != 'P' %}
+    <div class="vd-resuelto">
+        <b>Este comprobante ya esta {{ pago.get_estado_display|lower }}.</b>
+        {% if pago.monto_confirmado %}
+            Se confirmo s/{{ pago.monto_confirmado }}{% if not pago.cuadra %},
+            con una diferencia de {{ pago.diferencia|floatformat:2 }} contra el total{% endif %}.
+        {% endif %}
+        {% if pago.motivo_rechazo %}<br>Motivo: {{ pago.motivo_rechazo }}{% endif %}
+    </div>
+    {% endif %}
+
+    {% if pago.fuera_de_plazo %}
+    <div class="vd-recordatorio">
+        <b>Pago fuera de plazo.</b> Este cliente transfirio despues de que se le solto
+        la unidad. Si todavia hay stock, al validar se le vuelve a reservar; si no,
+        el sistema te avisa y corresponde devolverle el dinero.
+    </div>
+    {% endif %}
+
+    <div class="vd-cuerpo">
+
+        <div class="vd-caja vd-voucher">
+            {% if pago.voucher %}
+            <a href="{% url 'web:voucherPago' pago.id %}" target="_blank" rel="noopener">
+                <img src="{% url 'web:voucherPago' pago.id %}" alt="Comprobante {{ pago.nro_operacion }}">
+            </a>
+            <p class="vd-voucher-nota">Tocalo para verlo en grande</p>
+            {% else %}
+            <p>Sin comprobante adjunto.</p>
+            {% endif %}
+        </div>
+
+        <div>
+            <div class="vd-caja">
+                <dl class="vd-datos">
+                    <div class="vd-total">
+                        <dt>Total del pedido</dt>
+                        <dd>s/{{ pedido.monto_total }}</dd>
+                    </div>
+                    <div>
+                        <dt>Declara haber pagado</dt>
+                        <dd>s/{{ pago.monto_declarado }}</dd>
+                    </div>
+                    <div>
+                        <dt>N&deg; de operacion</dt>
+                        <dd>{{ pago.nro_operacion }}</dd>
+                    </div>
+                    <div>
+                        <dt>Cuenta</dt>
+                        <dd>{{ pago.cuenta.etiqueta }}</dd>
+                    </div>
+                    <div>
+                        <dt>Fecha del comprobante</dt>
+                        <dd>{{ pago.fecha_pago|date:"d/m/Y" }}</dd>
+                    </div>
+                    <div>
+                        <dt>Cliente</dt>
+                        <dd>{{ pedido.nombre_comprador }} {{ pedido.apellido_comprador }}</dd>
+                    </div>
+                    <div>
+                        <dt>Entrega</dt>
+                        <dd>{{ pedido.donde_recibe }}</dd>
+                    </div>
+                </dl>
+            </div>
+
+            {% if pago.estado == 'P' %}
+            <div class="vd-recordatorio">
+                Abri tu banca o la notificacion de Yape y confirma que el dinero entro.
+                <b>Una captura se falsifica en segundos; el extracto no.</b>
+            </div>
+
+            <form method="post" class="vd-caja">
+                {% csrf_token %}
+                <div class="vd-campo">
+                    <label for="{{ frmValidar.monto_confirmado.id_for_label }}">
+                        Monto que viste en tu cuenta
+                    </label>
+                    {{ frmValidar.monto_confirmado }}
+                    <small>{{ frmValidar.monto_confirmado.help_text }}</small>
+                    {% for e in frmValidar.monto_confirmado.errors %}
+                    <p class="vd-error">{{ e }}</p>
+                    {% endfor %}
+                </div>
+                <button type="submit" name="validar" class="vd-boton vd-validar">
+                    Confirmar el pago
+                </button>
+            </form>
+
+            <details class="vd-otro">
+                <summary>El comprobante no sirve</summary>
+                <form method="post" class="vd-caja">
+                    {% csrf_token %}
+                    <div class="vd-campo">
+                        <label for="{{ frmRechazar.motivo.id_for_label }}">
+                            {{ frmRechazar.motivo.label }}
+                        </label>
+                        {{ frmRechazar.motivo }}
+                        <small>{{ frmRechazar.motivo.help_text }}</small>
+                        {% for e in frmRechazar.motivo.errors %}
+                        <p class="vd-error">{{ e }}</p>
+                        {% endfor %}
+                    </div>
+                    <button type="submit" name="rechazar" class="vd-boton vd-rechazar">
+                        Rechazar comprobante
+                    </button>
+                </form>
+            </details>
+            {% endif %}
+        </div>
+    </div>
+
+    <a class="vd-volver" href="{% url 'web:validarPagos' %}">Volver a la bandeja</a>
+</main>
+
+</body>
+</html>

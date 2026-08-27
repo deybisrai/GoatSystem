@@ -1,0 +1,81 @@
+{% load static %}<!doctype html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Transporte entre ciudades - GOAT X</title>
+    {% include 'includes/panel_estilos.html' %}
+</head>
+<body>
+
+<header class="vp-head">
+    <a class="vp-marca" href="{% url 'web:index' %}">GOAT X</a>
+    <span class="vp-titulo">Transporte entre ciudades</span>
+    <span class="vp-cuenta {% if sin_transporte %}vp-hay{% endif %}">{{ sin_transporte|length }}</span>
+</header>
+
+<main class="vp-main">
+
+    {% if sin_transporte %}
+    <p class="vp-aviso vp-aviso-error">
+        <b>{{ sin_transporte|length }} ciudad(es) sin transporte programado.</b>
+        Sus productos no se estan ofreciendo ahi, y nadie va a reclamar por algo
+        que no vio. Programales el viaje.
+    </p>
+    {% endif %}
+
+    {% for ciudad in ciudades %}
+    <div class="tr-ciudad {% if ciudad.sin_viaje %}tr-alerta{% endif %}">
+        <div class="tr-cab">
+            <span class="tr-nombre">{{ ciudad.ubicacion.nombre }}</span>
+            {% if ciudad.sin_viaje %}
+            <span class="tr-estado tr-mal">Sin transporte programado</span>
+            {% else %}
+            <span class="tr-estado tr-ok">{{ ciudad.viaje.get_estado_display }}</span>
+            {% endif %}
+        </div>
+
+        {% if ciudad.viaje %}
+        <p class="tr-detalle">
+            Sale el {{ ciudad.viaje.fecha_despacho|date:"l j \d\e F" }} &middot;
+            llega el <b>{{ ciudad.viaje.fecha_disponible|date:"l j \d\e F" }}</b>
+            &middot; {{ ciudad.viaje.unidades }} unidad(es) cargadas
+        </p>
+        {% else %}
+        <p class="tr-detalle">
+            Sale los {{ ciudad.ubicacion.get_dia_despacho_display|lower }} y tarda
+            {{ ciudad.ubicacion.dias_viaje }} dia(s), pero no hay ningun viaje creado.
+        </p>
+        {% endif %}
+
+        {% if ciudad.esperando %}
+        <span class="tr-espera">
+            {{ ciudad.esperando|length }} pedido(s) pagados esperando que los mandes
+        </span>
+        <ul class="tr-lista">
+            {% for pedido, detalle, _ in ciudad.esperando %}
+            <li>{{ pedido.nro_pedido }} &middot; {{ detalle.item }} &times;{{ detalle.cantidad }}</li>
+            {% endfor %}
+        </ul>
+        {% endif %}
+
+        <p class="tr-detalle">
+            {{ ciudad.unidades }} unidad(es) en el almacen de {{ ciudad.ubicacion.nombre }}
+            &middot; {{ ciudad.puntos }} punto(s) de recojo
+        </p>
+    </div>
+    {% empty %}
+    <div class="vp-vacio">
+        <p><b>Solo hay una ciudad.</b></p>
+        <p class="vp-vacio-sub">Cuando agregues otra —Pampas, Huancayo— aparece aca con su transporte.</p>
+    </div>
+    {% endfor %}
+
+    <p class="vd-volver">
+        Los viajes se crean y se cargan desde <b>Admin &rarr; Traslados</b>.
+        El comando <code>programar_transportes</code> deja programado el proximo a cada ciudad.
+    </p>
+</main>
+
+</body>
+</html>
