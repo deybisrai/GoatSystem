@@ -7,8 +7,8 @@
     </ul>
 
     <div class="carrito-lista">
-        {% for linea in carrito %}
-            <article class="carrito-item">
+        {% for linea in lineas %}
+            <article class="carrito-item{% if linea.falla %} ci-sin-stock{% endif %}">
                 <a href="{% url 'web:producto' linea.sku %}" class="ci-img">
                     {% if linea.imagen %}
                         <img src="{{ linea.imagen }}" alt="{{ linea.nombre }}">
@@ -21,6 +21,12 @@
                     <p class="ci-categoria">{{ linea.categoria }}</p>
                     <h3 class="ci-nombre"><a href="{% url 'web:producto' linea.sku %}">{{ linea.nombre }}</a></h3>
                     <p class="ci-meta">{{ linea.color }}{% if linea.valor %} &middot; {{ linea.atributo }} {{ linea.valor }}{% endif %} &middot; {{ linea.sku }}</p>
+                    {% if linea.falla %}
+                    <p class="ci-falla">
+                        Este producto {{ linea.falla }}.
+                        <b>Quitalo del carrito para continuar.</b>
+                    </p>
+                    {% endif %}
                 </div>
 
                 <div class="ci-campos">
@@ -100,9 +106,24 @@
                 <span>Total a pagar</span>
                 <b>s/{{ carrito.total }}</b>
             </div>
+            {% if hay_fallas %}
+            <p class="carrito-bloqueado">
+                Hay productos que ya no podemos venderte.
+                Quitalos del carrito y segui con el resto.
+                {% if whatsapp %}
+                <br>Si ya pagaste uno de estos,
+                <a href="{{ whatsapp }}" target="_blank" rel="noopener">escribinos por WhatsApp</a>
+                y lo resolvemos.
+                {% endif %}
+            </p>
+            {% endif %}
             <div class="carrito-acciones">
                 <a href="{% url 'web:limpiarCarrito' %}" class="button boton-secundario">Limpiar Carrito</a>
+                {% if hay_fallas %}
+                <span class="button boton-inerte" aria-disabled="true">Realizar Pedido</span>
+                {% else %}
                 <a href="{% url 'web:identificarse' %}" class="button">Realizar Pedido</a>
+                {% endif %}
             </div>
         </div>
     </div>
@@ -318,6 +339,30 @@
             margin-top: 12px;
         }
         .carrito-acciones .button { flex: 1 1 auto; text-align: center; }
+
+        .ci-sin-stock { opacity: .72; }
+        .ci-sin-stock .ci-img img { filter: grayscale(1); }
+        .ci-falla {
+            margin: 6px 0 0;
+            font-size: 13px;
+            line-height: 1.45;
+            color: #7d3a13;
+        }
+        .ci-falla b { color: #b5541b; }
+        .carrito-bloqueado {
+            margin: 0 0 14px;
+            padding: 11px 15px;
+            border-left: 3px solid #b5541b;
+            background: #fff;
+            color: #7d3a13;
+            font-size: 13.5px;
+            line-height: 1.5;
+        }
+        .boton-inerte {
+            opacity: .45;
+            cursor: not-allowed;
+            pointer-events: none;
+        }
         .boton-secundario {
             background: #f4f4f4 !important;
             color: #555 !important;

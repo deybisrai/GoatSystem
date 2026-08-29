@@ -32,7 +32,7 @@ class Command(BaseCommand):
         for pedido in vencidos:
             unidades = sum(d.cantidad for d in pedido.detalles.all())
             self.stdout.write(
-                f'{pedido.nro_pedido}  {pedido.get_estado_display():<14} '
+                f'{pedido.referencia}  {pedido.get_estado_display():<14} '
                 f'vencio {pedido.reserva_vence:%d/%m %H:%M}  '
                 f'{unidades} unidad(es)  {pedido.email_comprador}'
             )

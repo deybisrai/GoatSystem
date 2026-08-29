@@ -22,6 +22,13 @@ class ClienteForm(forms.Form):
 class PedidoForm(forms.Form):
     """ Datos del checkout. Sirve igual para cliente registrado que para invitado. """
 
+    # viaja oculto y vuelve igual en cada reenvio del mismo formulario: es lo
+    # que deja reconocer un doble clic. Opcional a proposito: una pagina vieja
+    # sin el campo tiene que poder comprar igual.
+    token_checkout = forms.CharField(
+        max_length=32, required=False, widget=forms.HiddenInput,
+    )
+
     nombre = forms.CharField(label='Nombres', max_length=60)
     apellidos = forms.CharField(label='Apellidos', max_length=60)
     email = forms.EmailField(label='Email')

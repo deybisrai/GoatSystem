@@ -1,3 +1,6 @@
+from urllib.parse import quote
+from uuid import uuid4
+
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import authenticate, login, logout
@@ -61,7 +64,9 @@ def productosPorNombre(request):
 def productoDetalle(request, sku):
     """ Detalle de un color: sus unidades vendibles y los otros colores del mismo producto """
     variante = get_object_or_404(_variantes_visibles(), sku=sku)
-    items = variante.items.select_related('valor__atributo').order_by('valor__orden', 'valor__valor')
+    items = Inventario.precargar_vencidas(
+        variante.items.select_related('valor__atributo').order_by('valor__orden', 'valor__valor')
+    )
     otros_colores = _variantes_visibles().filter(producto=variante.producto).exclude(pk=variante.pk)
 
     atributo = variante.producto.categoria.atributo
@@ -82,7 +87,18 @@ def productoDetalle(request, sku):
 
 
 def carrito(request):
-    return render(request, 'carrito.html', {'carrito': Cart(request)})
+    carrito_actual = Cart(request)
+    fallas = carrito_actual.problemas()
+    return render(request, 'carrito.html', {
+        'carrito': carrito_actual,
+        # cada linea con su motivo pegado: la plantilla no sabe buscar en un
+        # diccionario por clave sin un templatetag, y no vale uno para esto
+        'lineas': [dict(l, falla=fallas.get(l['item_id'], '')) for l in carrito_actual],
+        'hay_fallas': bool(fallas),
+        # el que se quedo sin producto necesita a quien reclamarle, sobre todo
+        # si ya habia transferido: desde aca ya no llega a /pago
+        'whatsapp': _whatsapp(),
+    })
 
 
 def _es_ajax(request):
@@ -333,6 +349,23 @@ def _datos_pedido(usuario):
 CLAVE_INVITADO = 'compra_como_invitado'
 
 
+def _whatsapp(pedido=None):
+    """
+    Enlace al asesor, con el pedido ya escrito en el mensaje.
+
+    Lo que una pantalla no resuelve -- una devolucion, un caso raro -- lo
+    atiende una persona. Que el cliente no tenga que explicar cual es su pedido
+    es la diferencia entre que escriba y que abandone.
+    """
+    numero = getattr(settings, 'WHATSAPP_ASESOR', '')
+    if not numero:
+        return ''
+    texto = 'Hola, necesito ayuda con mi pedido'
+    if pedido is not None:
+        texto = f'{texto} {pedido.referencia}'
+    return f'https://wa.me/{numero}?text={quote(texto)}'
+
+
 def identificarse(request):
     """ Antes del checkout: elegir entre iniciar sesion o comprar como invitado """
     if len(Cart(request)) == 0:
@@ -379,7 +412,10 @@ def registrarPedido(request):
 
         messages.error(request, 'Revisa los datos marcados en el formulario')
     else:
-        frmPedido = PedidoForm(initial=_datos_pedido(request.user), puntos=puntos)
+        # un token por formulario pintado: identifica este intento de compra,
+        # y vuelve igual por mas veces que el cliente apriete Confirmar
+        inicial = dict(_datos_pedido(request.user), token_checkout=uuid4().hex)
+        frmPedido = PedidoForm(initial=inicial, puntos=puntos)
 
     # que se le puede prometer en cada mostrador, con el carrito que trae
     lineas = [
@@ -420,12 +456,32 @@ def pagoPedido(request):
     if pedido.descontado:
         return redirect('web:gracias')
 
-    # si el reloj se paso mientras el cliente miraba la pantalla, se cierra aca
-    # y las unidades vuelven a la venta. El cliente igual puede mandar su
-    # comprobante: si ya transfirio, lo peor seria no dejarlo avisar.
-    if pedido.reserva_vencida:
-        pedido.cancelar('Vencio el plazo para pagar')
+    # si el reloj se paso, se cierra el pedido, las unidades vuelven a la venta
+    # y el carrito se rearma con lo que tenia: el cliente no perdio su seleccion,
+    # perdio la reserva. Volver a un carrito vacio, sin explicacion, es la peor
+    # forma de enterarse.
+    # dos caminos al mismo lugar: o el plazo se acaba de cumplir, o el barrido
+    # llego primero y el pedido ya figura expirado. Antes solo se miraba lo
+    # primero, y como el barrido corre cada minuto, casi nunca se cumplia
+    if pedido.reserva_vencida or pedido.cerrado_sin_venta:
+        detalles = list(pedido.detalles.select_related('item'))
+        if pedido.reserva_vencida:
+            pedido.expirar()
         pedido.refresh_from_db()
+
+        Cart(request).restaurar([(d.item, d.cantidad) for d in detalles])
+        request.session.pop('ultimo_pedido', None)
+
+        if pedido.estado == Pedido.EXPIRADO:
+            aviso = 'Se vencio el plazo y soltamos tus productos.'
+        else:
+            aviso = f'No pudimos confirmar tu pago: {pedido.motivo_cancelacion}'
+        messages.error(
+            request,
+            f'{aviso} Los devolvimos a tu carrito: si siguen disponibles podes '
+            'volver a confirmar el pedido.',
+        )
+        return redirect('web:carrito')
 
     cuentas = CuentaRecaudadora.objects.filter(activo=True)
     if not cuentas.exists():
@@ -465,9 +521,8 @@ def pagoPedido(request):
         'cuentas': cuentas,
         'frmPago': frmPago,
         'pendiente': pendiente,
-        'rechazo': pedido.ultimo_rechazo,
-        'vencido': pedido.estado == Pedido.CANCELADO,
         'segundos': pedido.segundos_restantes if pedido.estado == Pedido.SOLICITADO else None,
+        'whatsapp': _whatsapp(pedido),
     })
 
 
@@ -544,11 +599,11 @@ def validarPago(request, pago_id):
                     messages.error(request, str(problema))
                 else:
                     if pago.cuadra:
-                        messages.success(request, f'{pago.pedido.nro_pedido} confirmado.')
+                        messages.success(request, f'{pago.pedido.referencia} confirmado.')
                     else:
                         messages.error(
                             request,
-                            f'{pago.pedido.nro_pedido} quedo con una diferencia de '
+                            f'{pago.pedido.referencia} quedo con una diferencia de '
                             f'{pago.diferencia:+.2f} contra el total del pedido.'
                         )
                     return redirect('web:validarPagos')
@@ -602,4 +657,7 @@ def gracias(request):
         return redirect('web:index')
 
     pedido = get_object_or_404(Pedido.objects.prefetch_related('detalles'), pk=pedido_id)
-    return render(request, 'gracias.html', {'pedido': pedido})
+    return render(request, 'gracias.html', {
+        'pedido': pedido,
+        'whatsapp': _whatsapp(pedido),
+    })

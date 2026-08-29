@@ -54,7 +54,7 @@
         </span>
         <ul class="tr-lista">
             {% for pedido, detalle, _ in ciudad.esperando %}
-            <li>{{ pedido.nro_pedido }} &middot; {{ detalle.item }} &times;{{ detalle.cantidad }}</li>
+            <li>{{ pedido.referencia }} &middot; {{ detalle.item }} &times;{{ detalle.cantidad }}</li>
             {% endfor %}
         </ul>
         {% endif %}

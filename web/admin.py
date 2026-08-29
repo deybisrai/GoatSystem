@@ -457,17 +457,18 @@ class PedidoDetalleInline(admin.TabularInline):
 
 @admin.register(Pedido)
 class PedidoAdmin(admin.ModelAdmin):
-    list_display = ('nro_pedido', 'nombre_comprador', 'apellido_comprador', 'monto_total',
+    list_display = ('referencia', 'nombre_comprador', 'apellido_comprador', 'monto_total',
                     'estado', 'entrega', 'es_invitado', 'fecha_registro')
     list_filter = ('estado', 'modo_entrega', 'punto_recojo')
-    search_fields = ('nro_pedido', 'email_comprador', 'nombre_comprador', 'apellido_comprador')
+    search_fields = ('nro_pedido', 'codigo_reserva', 'email_comprador',
+                     'nombre_comprador', 'apellido_comprador')
     inlines = [PedidoDetalleInline]
     actions = ['marcar_enviado', 'agregar_a_traslado', 'marcar_listo_recojo',
                'marcar_entregado', 'cancelar_pedido']
 
     # El estado no se escribe a mano: ponerlo en "Cancelado" desde el formulario
     # dejaria el stock descontado para siempre. Se mueve con las acciones.
-    readonly_fields = ('nro_pedido', 'estado', 'monto_total', 'descuento_aplicado',
+    readonly_fields = ('codigo_reserva', 'nro_pedido', 'estado', 'monto_total', 'descuento_aplicado',
                        'fecha_cancelacion', 'motivo_cancelacion',
                        'modo_entrega', 'punto_recojo_nombre', 'punto_recojo_direccion')
 
@@ -488,7 +489,7 @@ class PedidoAdmin(admin.ModelAdmin):
                 pedido.cambiar_estado(destino, usuario=request.user)
                 movidos += 1
             except ValueError as error:
-                self.message_user(request, f'{pedido.nro_pedido}: {error}', level='warning')
+                self.message_user(request, f'{pedido.referencia}: {error}', level='warning')
         if movidos:
             etiqueta = dict(Pedido.ESTADO_CHOICES)[destino].lower()
             self.message_user(request, f'{movidos} pedido(s) marcados como {etiqueta}.')
@@ -514,7 +515,7 @@ class PedidoAdmin(admin.ModelAdmin):
             destino = getattr(pedido.punto_recojo, 'ubicacion', None)
             if not pedido.es_recojo or destino is None:
                 self.message_user(
-                    request, f'{pedido.nro_pedido}: no es un pedido de recojo.', level='warning'
+                    request, f'{pedido.referencia}: no es un pedido de recojo.', level='warning'
                 )
                 continue
 
@@ -527,7 +528,7 @@ class PedidoAdmin(admin.ModelAdmin):
             if viaje is None:
                 self.message_user(
                     request,
-                    f'{pedido.nro_pedido}: no hay transporte programado a {destino}.',
+                    f'{pedido.referencia}: no hay transporte programado a {destino}.',
                     level='error',
                 )
                 continue
@@ -542,7 +543,7 @@ class PedidoAdmin(admin.ModelAdmin):
                     )
                     sumados += 1
                 except ValueError as error:
-                    self.message_user(request, f'{pedido.nro_pedido}: {error}', level='error')
+                    self.message_user(request, f'{pedido.referencia}: {error}', level='error')
 
         if sumados:
             self.message_user(request, f'{sumados} linea(s) agregadas al traslado.')
@@ -568,7 +569,7 @@ class PedidoAdmin(admin.ModelAdmin):
                         pedido.cancelar(formulario.cleaned_data['motivo'], usuario=request.user)
                         cancelados += 1
                     except ValueError as error:
-                        self.message_user(request, f'{pedido.nro_pedido}: {error}', level='error')
+                        self.message_user(request, f'{pedido.referencia}: {error}', level='error')
                 if cancelados:
                     self.message_user(
                         request, f'{cancelados} pedido(s) cancelados: el stock volvio al almacen.'
@@ -601,7 +602,8 @@ class MovimientoInventarioAdmin(admin.ModelAdmin):
                     'stock_resultante', 'costo_unitario', 'papel', 'usuario')
     list_filter = ('tipo', 'item__variante__producto__categoria', 'fecha')
     search_fields = ('item__variante__sku', 'item__variante__producto__nombre',
-                     'compra__nro_documento', 'pedido__nro_pedido')
+                     'compra__nro_documento', 'pedido__nro_pedido',
+                     'pedido__codigo_reserva')
     date_hierarchy = 'fecha'
 
     def get_queryset(self, request):
@@ -673,9 +675,10 @@ class PagoAdmin(admin.ModelAdmin):
     pantalla mas usada del sistema.
     """
     list_display = ('creado', 'esperando', 'miniatura', 'nro_operacion', 'que_pedido',
-                    'cuenta', 'monto_declarado', 'estado', 'a_tiempo', 'descuadre')
-    list_filter = ('estado', 'fuera_de_plazo', 'cuenta', 'creado')
-    search_fields = ('nro_operacion', 'pedido__nro_pedido', 'pedido__email_comprador')
+                    'cuenta', 'monto_declarado', 'estado', 'descuadre')
+    list_filter = ('estado', 'cuenta', 'creado')
+    search_fields = ('nro_operacion', 'pedido__nro_pedido', 'pedido__codigo_reserva',
+                     'pedido__email_comprador')
     date_hierarchy = 'creado'
     actions = ['validar_pago', 'rechazar_pago']
 
@@ -683,7 +686,7 @@ class PagoAdmin(admin.ModelAdmin):
     # El voucher entra como `comprobante` y no como el campo crudo: el admin le
     # pide .url a un FileField de solo lectura, y este almacen no tiene URL.
     fields = ('pedido', 'cuenta', 'monto_declarado', 'nro_operacion', 'comprobante',
-              'fecha_pago', 'estado', 'fuera_de_plazo', 'monto_confirmado', 'validado_por',
+              'fecha_pago', 'estado', 'monto_confirmado', 'validado_por',
               'fecha_validacion', 'motivo_rechazo', 'creado')
     readonly_fields = fields
 
@@ -709,7 +712,7 @@ class PagoAdmin(admin.ModelAdmin):
 
     @admin.display(description='Pedido', ordering='pedido__nro_pedido')
     def que_pedido(self, obj):
-        return obj.pedido.nro_pedido
+        return obj.pedido.referencia
 
     @admin.display(description='Esperando', ordering='creado')
     def esperando(self, obj):
@@ -730,10 +733,6 @@ class PagoAdmin(admin.ModelAdmin):
             '<img src="{}" style="height:52px;border:1px solid #ddd;border-radius:3px">'
             '</a>', url, url,
         )
-
-    @admin.display(description='Plazo', ordering='fuera_de_plazo')
-    def a_tiempo(self, obj):
-        return 'FUERA DE PLAZO' if obj.fuera_de_plazo else 'a tiempo'
 
     @admin.display(description='Diferencia')
     def descuadre(self, obj):

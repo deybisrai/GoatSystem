@@ -120,7 +120,10 @@ agencia, el pedido de ayer sigue diciendo donde se retiro.
 
 **Un punto de recojo no es un almacen.** GOAT X (Huancavelica) y Monetix (Lircay)
 guardan mercaderia; Daily Credits y Vision para crecer solo atienden. Esa
-diferencia se modela cuando llegue el stock por ubicacion, no antes.
+diferencia sigue sin modelarse y no hace falta: lo que el sistema necesita saber
+es de que ciudad se sirve cada mostrador, y eso es `PuntoRecojo.ubicacion`,
+obligatoria desde la migracion 0028. La ubicacion manda. Cuatro mostradores,
+dos ciudades.
 
 **Un pedido reserva, no descuenta.** `crear_pedido()` llama a
 `Inventario.reservar()`, que sube `reservado` sin tocar `stock` ni el kardex. El
@@ -214,68 +217,84 @@ al vuelo; asi no hay que acordarse de revertir precios cuando termina la campana
 | `web/models/promociones.py`| Campana, Cupon |
 | `web/carrito.py`           | Carrito en sesion |
 | `web/pedidos.py`           | Convierte el carrito en venta. Aparte de views porque el POS lo reutilizara |
+| `web/avisos.py`            | Avisa por correo que llego un comprobante por validar |
 | `web/management/commands/verificar_kardex.py` | Compara el saldo cacheado contra el historial |
+| `web/management/commands/vencer_reservas.py` | Suelta las reservas de los pedidos que no pagaron a tiempo |
+| `web/management/commands/programar_transportes.py` | Programa el proximo viaje a la ciudad que no lo tenga |
 | `herramientas/generar_logo.py` | Arma el logo horizontal desde el cuadrado |
 
 ## Estado
 
-6 de 11 fases cerradas. La tienda vende de punta a punta (catalogo, carrito,
-cupones, checkout de invitado, descuento de stock) y ahora el ciclo es
-auditable: cada unidad tiene un documento detras y toda correccion deja rastro.
-Sigue **sin cobro**: el pedido nace en estado "Solicitado".
+**6 de 11 fases cerradas y la 7 practicamente terminada.** 284 tests, 23 modelos,
+28 migraciones. La tienda vende, cobra y entrega de punta a punta:
 
-Son dos negocios sobre los mismos modelos, y conviene no mezclarlos:
+- catalogo con variantes, carrito, cupones y checkout de invitado
+- ciclo auditable: cada unidad tiene un documento detras (fase 6)
+- cobro por transferencia con validacion humana (fase 7)
+- entrega a domicilio o recojo en cuatro mostradores
+- stock por ciudad y transporte entre ellas
 
-- **Tienda online**: opera 24 horas y nunca toca un billete. El cliente paga con
-  pasarela; el dinero vive ahi y se liquida al banco dias despues. No tiene caja.
-- **Tienda fisica**: abre y cierra su dia con efectivo bajo custodia de una persona.
-  Necesita caja, boveda, billetaje y cierre de dia.
+Falta para lanzar: **8 seguridad** y **9 despliegue**. Despues 10 panel
+administrativo (Django + HTMX) y 11 punto de venta con caja y boveda.
+
+### Los dos negocios
+
+Son dos operaciones sobre los mismos modelos, y conviene no mezclarlas:
+
+- **Tienda online**: opera 24 horas y nunca toca un billete. Se cobra por
+  transferencia y el dinero cae a nuestras cuentas. No tiene caja.
+- **Tienda fisica**: abre y cierra su dia con efectivo bajo custodia de una
+  persona. Necesita caja, boveda, billetaje y cierre de dia (fase 11).
 
 La caja no cuenta ventas: **custodia efectivo**. Por eso una venta con tarjeta o
 Yape tampoco entra a caja, aunque sea presencial. El corte no es online contra
 fisico, es efectivo contra no-efectivo.
 
-Cuando exista el dia operativo, seran **dos relojes independientes**: `DiaOperativo`
+Cuando exista el dia operativo seran **dos relojes independientes**: `DiaOperativo`
 gobierna solo lo que toca efectivo o almacen, y la tienda online se rige por la
 fecha calendario real. Si el personal no cierra caja, la tienda fisica se bloquea
 y la online sigue vendiendo.
 
-**En curso: Fase 7 — cobro por transferencia.** Sin pasarela: el cliente paga a
-nuestras cuentas (BCP, Yape, QR), declara su numero de operacion y sube una
-captura. Alguien lo valida despues mirando la cuenta real.
+### Lo que hace la fase 7
 
-Ya hecho: `CuentaRecaudadora` y `Pago`, el estado `EN_VALIDACION`, la pantalla
-`/pago` con cuenta regresiva, la bandeja de validacion en el admin, el almacen
-privado de vouchers, la reserva con vencimiento (`reservado` separado de `stock`,
-comando `vencer_reservas`, pago fuera de plazo), y el **recojo en tienda** con los
-cuatro puntos y el estado `LISTO_RECOJO`.
+**Cobro sin pasarela.** El cliente paga a nuestras cuentas, declara su numero de
+operacion y sube una captura. Alguien lo valida mirando la cuenta real. Cero
+comision contra el 3-4% de una pasarela, a cambio de trabajo humano.
 
-**Validar es contar, no aceptar.** `Pago.validar()` exige el monto que se vio en
-la cuenta; no hay boton que acepte el que declaro el cliente. Mismo criterio con
-el que la boveda confirmara una remesa en la fase 11.
+Cuentas cargadas (editables desde el admin, sembradas en la 0017):
 
-**El voucher es evidencia, no prueba.** Una captura de Yape se falsifica en
-segundos. La prueba es el extracto. No se despacha sin ver la plata.
+| Metodo | Datos |
+|---|---|
+| QR Yape | Monetix Retail, `cuentas/qr_yape_retail.png` |
+| Yape | 955134139 |
+| BCP corriente | 3507296754036, CCI 00235000729675403679 |
 
-**Un pedido no llega a Pagado sin un `Pago` detras.** Se quito la accion "marcar
-como pagado" del admin a proposito: todo movimiento tiene documento.
+**Plazos** (en `settings.py`): `MINUTOS_RESERVA` 15, `HORAS_VALIDACION` 12,
+`HORAS_ALERTA_VALIDACION` 6.
+
+**Pantallas propias, fuera del admin:**
+
+- `/pago` — el cliente elige cuenta, ve el QR y sube su comprobante
+- `/validar` — bandeja de comprobantes hecha para el celular, ordenada por
+  antiguedad; ahi llega el enlace del correo de aviso
+- `/transportes` — que ciudad quedo sin viaje programado
 
 **No hay contra-entrega** (decidido el 2026-08-27). Pagar en billetes al
 motorizado genera efectivo bajo custodia, o sea una caja con otro nombre, y eso
-llega bien hecho en la fase 11. La tienda online cobra solo por transferencia.
+llega bien hecho en la fase 11.
 
-El stock por ubicacion y los traslados **ya estan hechos** (se adelantaron desde
-la fase 10 porque el recojo en Lircay los necesitaba).
+### Lo unico abierto de la fase 7
 
-Despues: 8 seguridad, 9 despliegue (**la tienda online sale a produccion aqui**),
-10 panel administrativo con Django + HTMX, 11 punto de venta y caja.
+Si el horario del punto de recojo se guarda estructurado (hora de apertura y
+cierre) para poder decir "retiralo hoy hasta las 10pm". Por ahora se decidio que
+no hace falta: dice "Retiralo hoy" con el horario a la vista al lado.
 
-**Pendiente de la fase 10:** hoy el stock es uno solo, sin ciudad. GOAT X es el
-almacen general y Monetix Lircay tambien guarda; mover mercaderia entre ellos es
-un movimiento de inventario real y va a necesitar su documento con dos pasos
-(quien envia declara, quien recibe confirma), igual que la remesa a boveda. La
-regla de negocio decidida: **se ofrece el producto en todas las ciudades**, pero
-la pantalla distingue "retiralo hoy" de "por encargo, te confirmamos la fecha".
+### El estado del repositorio
+
+Rama `main`, ultimo commit `e5711da fase 7 proceso`: 53 archivos con todo lo de
+las fases 6 y 7, incluidas las migraciones 0014 a 0028. El codigo esta commiteado;
+lo unico modificado es este archivo. Conviene arrancar mirando `git status`: esta
+linea envejece sola.
 
 ## Bloqueantes de produccion
 

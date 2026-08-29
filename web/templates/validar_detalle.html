@@ -3,14 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ pedido.nro_pedido }} - Validar pago</title>
+    <title>{{ pedido.referencia }} - Validar pago</title>
     {% include 'includes/panel_estilos.html' %}
 </head>
 <body>
 
 <header class="vp-head">
     <a class="vp-marca" href="{% url 'web:validarPagos' %}">&larr;</a>
-    <span class="vp-titulo">{{ pedido.nro_pedido }}</span>
+    <span class="vp-titulo">{{ pedido.referencia }}</span>
     <span class="vp-cuenta {% if pago.demorado %}vp-hay{% endif %}">{{ pago.espera }}</span>
 </header>
 
@@ -29,14 +29,6 @@
             con una diferencia de {{ pago.diferencia|floatformat:2 }} contra el total{% endif %}.
         {% endif %}
         {% if pago.motivo_rechazo %}<br>Motivo: {{ pago.motivo_rechazo }}{% endif %}
-    </div>
-    {% endif %}
-
-    {% if pago.fuera_de_plazo %}
-    <div class="vd-recordatorio">
-        <b>Pago fuera de plazo.</b> Este cliente transfirio despues de que se le solto
-        la unidad. Si todavia hay stock, al validar se le vuelve a reservar; si no,
-        el sistema te avisa y corresponde devolverle el dinero.
     </div>
     {% endif %}
 

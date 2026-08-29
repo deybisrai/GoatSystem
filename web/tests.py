@@ -10,6 +10,7 @@ from django.contrib.auth.models import User
 from django.core import mail
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.cache import cache
 from django.core.management import call_command
 from django.db import transaction
 from django.db.models import RestrictedError
@@ -297,10 +298,18 @@ class CheckoutTests(TestCase):
         self._confirmar()
         self.assertEqual(self.client.session.get('cart'), {})
 
-    def test_nro_pedido_se_genera_solo(self):
+    def test_confirmar_da_codigo_de_reserva_pero_no_numero(self):
+        """
+        Confirmar el checkout reserva unidades, no vende. El correlativo se
+        guarda para las ventas de verdad: un carrito abandonado no lo gasta.
+        """
         self._agregar(self.t40, 1)
         self._confirmar()
-        self.assertRegex(Pedido.objects.get().nro_pedido, r'^P\d{8}-\d{5}$')
+
+        pedido = Pedido.objects.get()
+        self.assertIsNone(pedido.nro_pedido)
+        self.assertRegex(pedido.codigo_reserva, r'^R-[0-9A-F]{8}$')
+        self.assertEqual(pedido.referencia, pedido.codigo_reserva)
 
     def test_compra_de_varias_tallas_a_la_vez(self):
         self._agregar(self.t40, 2)
@@ -384,7 +393,7 @@ class CheckoutTests(TestCase):
 
         respuesta = self.client.get(reverse('web:gracias'))
         self.assertEqual(respuesta.status_code, 200)
-        self.assertContains(respuesta, Pedido.objects.get().nro_pedido)
+        self.assertContains(respuesta, Pedido.objects.get().referencia)
 
     def test_gracias_sin_pedido_previo_redirige_al_inicio(self):
         respuesta = self.client.get(reverse('web:gracias'))
@@ -1828,13 +1837,19 @@ class PagoTests(_AlmacenMixin, _VentaMixin, TestCase):
         self.assertEqual(pago.diferencia, Decimal('420.00') - self.pedido.monto_total)
         self.assertFalse(pago.cuadra)
 
-    def test_rechazar_deja_el_pedido_esperando(self):
+    def test_rechazar_cancela_el_pedido_y_suelta_las_unidades(self):
+        """
+        Un comprobante rechazado es un pedido sin pago detras, y no puede
+        retener inventario. Con la validacion sin vencimiento, dejarlo abierto
+        congelaba la unidad para siempre.
+        """
         pago = self._declarar()
         pago.rechazar('La captura esta borrosa, no se lee el monto')
 
         self.pedido.refresh_from_db()
         self.assertEqual(pago.estado, Pago.RECHAZADO)
-        self.assertEqual(self.pedido.estado, Pedido.EN_VALIDACION)
+        self.assertEqual(self.pedido.estado, Pedido.CANCELADO)
+        self.assertIn('rechazado', self.pedido.motivo_cancelacion.lower())
         self.assertIn('borrosa', self.pedido.ultimo_rechazo.motivo_rechazo)
 
     def test_rechazar_exige_un_motivo(self):
@@ -1848,15 +1863,6 @@ class PagoTests(_AlmacenMixin, _VentaMixin, TestCase):
         with self.assertRaises(ValueError):
             pago.rechazar('Me arrepenti')
 
-    def test_tras_un_rechazo_se_puede_declarar_otro(self):
-        primero = self._declarar('OP-0001')
-        primero.rechazar('Captura ilegible')
-
-        segundo = self._declarar('OP-0002')
-        self.pedido.refresh_from_db()
-        self.assertEqual(self.pedido.pago_pendiente, segundo)
-        self.assertEqual(self.pedido.pagos.count(), 2)
-
     def test_el_mismo_comprobante_no_se_usa_dos_veces(self):
         self._declarar('OP-0001')
         with self.assertRaises(IntegrityError):
@@ -1867,18 +1873,6 @@ class PagoTests(_AlmacenMixin, _VentaMixin, TestCase):
         self._declarar('OP-0001')
         self._declarar('OP-0001', cuenta=_cuenta_yape())
         self.assertEqual(self.pedido.pagos.count(), 2)
-
-    def test_un_pedido_cancelado_admite_comprobantes_pero_marcados(self):
-        """
-        Si ya transfirio, lo peor que puede hacer el sistema es no dejarlo avisar.
-        Se acepta el comprobante, marcado, para que alguien lo mire.
-        """
-        self.pedido.cancelar('El cliente se arrepintio')
-
-        pago = self._declarar()
-        self.assertTrue(pago.fuera_de_plazo)
-        self.pedido.refresh_from_db()
-        self.assertEqual(self.pedido.estado, Pedido.CANCELADO)
 
     def test_un_pedido_despachado_no_admite_comprobantes(self):
         self._pagar(self.pedido, nro='OP-YA')
@@ -2133,7 +2127,7 @@ class AdminPagoTests(_AlmacenMixin, _VentaMixin, TestCase):
         self.pago.refresh_from_db()
         self.pedido.refresh_from_db()
         self.assertEqual(self.pago.estado, Pago.RECHAZADO)
-        self.assertEqual(self.pedido.estado, Pedido.EN_VALIDACION)
+        self.assertEqual(self.pedido.estado, Pedido.CANCELADO)
         self.assertIn('no coincide', self.pago.motivo_rechazo)
 
     def test_el_pedido_no_se_marca_pagado_a_mano(self):
@@ -2177,10 +2171,15 @@ class ReservaConVencimientoTests(_AlmacenMixin, _VentaMixin, TestCase):
         self.assertGreater(faltan, settings.MINUTOS_RESERVA * 60 - 60)
         self.assertLessEqual(faltan, settings.MINUTOS_RESERVA * 60)
 
-    def test_el_comprobante_detiene_el_reloj(self):
+    def test_el_comprobante_apaga_el_reloj(self):
+        """
+        Con el comprobante arriba la unidad queda congelada, sin vencimiento.
+        Que nosotros tardemos en validar no puede costarle el producto a quien
+        ya transfirio: lo que corre despues es nuestra alarma interna.
+        """
         self._agregar(self.t40, 1)
         pedido = self._comprar()
-        vencia = pedido.reserva_vence
+        self.assertIsNotNone(pedido.reserva_vence)
 
         pedido.declarar_pago(
             cuenta=self.cuenta, monto_declarado=pedido.monto_total,
@@ -2188,9 +2187,9 @@ class ReservaConVencimientoTests(_AlmacenMixin, _VentaMixin, TestCase):
         )
         pedido.refresh_from_db()
 
-        # deja de correr contra el cliente: el plazo que queda es nuestro
-        self.assertGreater(pedido.reserva_vence, vencia)
-        self.assertGreater(pedido.segundos_restantes, settings.MINUTOS_RESERVA * 60)
+        self.assertEqual(pedido.estado, Pedido.EN_VALIDACION)
+        self.assertIsNone(pedido.reserva_vence)
+        self.assertIsNone(pedido.segundos_restantes)
 
     def test_al_pagar_el_reloj_se_apaga(self):
         self._agregar(self.t40, 1)
@@ -2207,15 +2206,19 @@ class ReservaConVencimientoTests(_AlmacenMixin, _VentaMixin, TestCase):
         self._agregar(self.t40, 2)
         pedido = self._envejecer(self._comprar())
 
+        # el plazo se cumplio solo: la unidad ya se puede vender aunque el pedido
+        # todavia figure como Solicitado. El contador crudo va atrasado a proposito
         self.t40.refresh_from_db()
-        self.assertEqual(self.t40.disponible, 0)
+        self.assertEqual(self.t40.disponible, 2)
+        self.assertEqual(self.t40.reservado, 2)
 
         self.assertEqual(Pedido.vencer_reservas(), 1)
 
         pedido.refresh_from_db()
         self.t40.refresh_from_db()
-        self.assertEqual(pedido.estado, Pedido.CANCELADO)
+        self.assertEqual(pedido.estado, Pedido.EXPIRADO)
         self.assertIn('plazo', pedido.motivo_cancelacion)
+        self.assertEqual(self.t40.reservado, 0)      # el barrido pone al dia el contador
         self.assertEqual(self.t40.disponible, 2)
         self.assertEqual(self.t40.stock, 2)          # nunca se movieron del estante
 
@@ -2256,6 +2259,75 @@ class ReservaConVencimientoTests(_AlmacenMixin, _VentaMixin, TestCase):
         self.assertContains(respuesta, 'sin stock')
         self.assertEqual(Pedido.objects.count(), 1)
 
+    # --- la costura: el plazo se cumple sin que nadie lo barra ---
+
+    def test_la_ultima_unidad_vencida_vuelve_a_venderse(self):
+        """
+        El caso que estaba roto. Con la ultima unidad reservada por un pedido
+        vencido, el catalogo la daba por agotada, el carrito no dejaba agregarla,
+        y lo unico que la soltaba vivia detras del checkout, al que no se llegaba
+        sin agregarla antes. Quedaba trabada hasta que alguien corriera el comando.
+        """
+        self._agregar(self.t40, 2)                   # se lleva todo el stock
+        self._envejecer(self._comprar())
+
+        # la ficha ya no dice agotado
+        respuesta = self.client.get(reverse('web:producto', args=[self.variante.sku]))
+        self.assertTrue(respuesta.context['hay_stock'])
+
+        # y otro cliente puede agregarla: esa era la puerta cerrada
+        otro = Client()
+        otro.post(reverse('web:agregarCarrito'), {
+            'item_id': self.t40.id, 'cantidad': 2, 'sku': self.t40.variante.sku,
+        })
+        otro.get(reverse('web:continuarComoInvitado'))
+        otro.post(reverse('web:registrarPedido'), DATOS_CHECKOUT)
+
+        # el viejo quedo cancelado y el nuevo se quedo con las unidades
+        self.assertEqual(Pedido.objects.filter(estado=Pedido.EXPIRADO).count(), 1)
+        self.assertEqual(Pedido.objects.filter(estado=Pedido.SOLICITADO).count(), 1)
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.reservado, 2)
+
+    def test_una_reserva_viva_sigue_bloqueando(self):
+        """ El arreglo no debe abrir la puerta antes de que el plazo se cumpla """
+        self._agregar(self.t40, 2)
+        self._comprar()                              # sin envejecer: el reloj corre
+
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.disponible, 0)
+
+        otro = Client()
+        otro.post(reverse('web:agregarCarrito'), {
+            'item_id': self.t40.id, 'cantidad': 1, 'sku': self.t40.variante.sku,
+        })
+        self.assertContains(otro.get(reverse('web:carrito')), 'sin stock')
+
+    def test_reservar_mide_igual_que_el_catalogo(self):
+        """
+        Si la ficha ofrece la unidad, confirmar no puede fallar. `reservar()`
+        miraba `stock - reservado` crudo y decia que no habia nada.
+        """
+        self._agregar(self.t40, 2)
+        self._envejecer(self._comprar())
+
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.disponible, 2)
+        self.t40.reservar(2)                         # no levanta: mide lo mismo
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.disponible, 0)
+
+    def test_precargar_evita_una_consulta_por_fila(self):
+        """ Mirar ocho tallas tiene que costar una consulta, no ocho """
+        self._agregar(self.t40, 2)
+        self._envejecer(self._comprar())
+
+        items = Inventario.precargar_vencidas(Inventario.objects.filter(variante=self.variante))
+        por_id = {i.pk: i for i in items}
+        with self.assertNumQueries(0):
+            self.assertEqual(por_id[self.t40.pk].disponible, 2)
+            self.assertEqual(por_id[self.t41.pk].disponible, 0)
+
     # --- la pantalla ---
 
     def test_la_pantalla_muestra_la_cuenta_regresiva(self):
@@ -2267,80 +2339,35 @@ class ReservaConVencimientoTests(_AlmacenMixin, _VentaMixin, TestCase):
         self.assertContains(respuesta, 'pg-reloj')
         self.assertGreater(respuesta.context['segundos'], 0)
 
-    def test_al_vencer_la_pantalla_avisa_y_deja_declarar(self):
-        self._agregar(self.t40, 1)
+    def test_al_vencer_vuelve_al_carrito_con_sus_productos(self):
+        """
+        No perdio su seleccion, perdio la reserva. Volver a un carrito vacio y
+        sin explicacion es la peor forma de enterarse.
+        """
+        self._agregar(self.t40, 2)
         pedido = self._envejecer(self._comprar())
+        self.assertEqual(self.client.session.get('cart'), {})    # el checkout lo vacio
 
         respuesta = self.client.get(reverse('web:pagoPedido'))
-        self.assertContains(respuesta, 'Se vencio el plazo')
-        self.assertContains(respuesta, 'mandanos el comprobante igual')
-        self.assertContains(respuesta, 'Enviar comprobante')
+        self.assertRedirects(respuesta, reverse('web:carrito'))
 
         pedido.refresh_from_db()
-        self.assertEqual(pedido.estado, Pedido.CANCELADO)
+        self.assertEqual(pedido.estado, Pedido.EXPIRADO)
 
-    def test_una_vez_vencido_ya_no_hay_reloj(self):
+        # el carrito volvio con lo que tenia, y las unidades al catalogo
+        carrito = self.client.get(reverse('web:carrito'))
+        self.assertContains(carrito, self.variante.sku)
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.reservado, 0)
+        self.assertEqual(self.t40.disponible, 2)
+
+    def test_al_vencer_se_lo_dice(self):
         self._agregar(self.t40, 1)
         self._envejecer(self._comprar())
 
-        respuesta = self.client.get(reverse('web:pagoPedido'))
-        self.assertIsNone(respuesta.context['segundos'])
-
-    # --- pago tardio ---
-
-    def test_el_pago_tardio_llega_marcado(self):
-        self._agregar(self.t40, 1)
-        pedido = self._envejecer(self._comprar())
-        Pedido.vencer_reservas()
-
-        pago = pedido.declarar_pago(
-            cuenta=self.cuenta, monto_declarado=pedido.monto_total,
-            nro_operacion='OP-3002', voucher=_imagen(), fecha_pago=timezone.localdate(),
-        )
-        self.assertTrue(pago.fuera_de_plazo)
-
-    def test_validar_un_pago_tardio_revive_el_pedido_si_hay_stock(self):
-        self._agregar(self.t40, 1)
-        pedido = self._envejecer(self._comprar())
-        Pedido.vencer_reservas()
-
-        pago = pedido.declarar_pago(
-            cuenta=self.cuenta, monto_declarado=pedido.monto_total,
-            nro_operacion='OP-3003', voucher=_imagen(), fecha_pago=timezone.localdate(),
-        )
-        pago.validar(pedido.monto_total)
-
-        pedido.refresh_from_db()
-        self.t40.refresh_from_db()
-        self.assertEqual(pedido.estado, Pedido.PAGADO)
-        self.assertEqual(pedido.motivo_cancelacion, '')
-        self.assertEqual(self.t40.stock, 1)          # la unidad salio de verdad
-        self.assertEqual(self.t40.stock_segun_kardex, 1)
-
-    def test_validar_un_pago_tardio_sin_stock_avisa_que_hay_que_devolver(self):
-        self._agregar(self.t40, 2)
-        tarde = self._envejecer(self._comprar())
-        Pedido.vencer_reservas()
-
-        # otro cliente se lleva las dos unidades y paga
-        otro = Client()
-        otro.post(reverse('web:agregarCarrito'), {
-            'item_id': self.t40.id, 'cantidad': 2, 'sku': self.t40.variante.sku,
-        })
-        otro.get(reverse('web:continuarComoInvitado'))
-        otro.post(reverse('web:registrarPedido'), DATOS_CHECKOUT)
-        self._pagar(Pedido.objects.latest('id'), nro='OP-OTRO')
-
-        pago = tarde.declarar_pago(
-            cuenta=self.cuenta, monto_declarado=tarde.monto_total,
-            nro_operacion='OP-3004', voucher=_imagen(), fecha_pago=timezone.localdate(),
-        )
-        with self.assertRaises(ValueError) as fallo:
-            pago.validar(tarde.monto_total)
-        self.assertIn('devolverle el dinero', str(fallo.exception))
-
-        tarde.refresh_from_db()
-        self.assertEqual(tarde.estado, Pedido.CANCELADO)
+        respuesta = self.client.get(reverse('web:pagoPedido'), follow=True)
+        self.assertContains(respuesta, 'Se vencio el plazo')
+        self.assertContains(respuesta, 'carrito')
 
     # --- el comando ---
 
@@ -2350,7 +2377,7 @@ class ReservaConVencimientoTests(_AlmacenMixin, _VentaMixin, TestCase):
 
         salida = StringIO()
         call_command('vencer_reservas', '--simular', stdout=salida)
-        self.assertIn(pedido.nro_pedido, salida.getvalue())
+        self.assertIn(pedido.referencia, salida.getvalue())
 
         pedido.refresh_from_db()
         self.assertEqual(pedido.estado, Pedido.SOLICITADO)
@@ -2365,7 +2392,7 @@ class ReservaConVencimientoTests(_AlmacenMixin, _VentaMixin, TestCase):
 
         pedido.refresh_from_db()
         self.t40.refresh_from_db()
-        self.assertEqual(pedido.estado, Pedido.CANCELADO)
+        self.assertEqual(pedido.estado, Pedido.EXPIRADO)
         self.assertEqual(self.t40.disponible, 2)
 
     def test_sin_vencidas_el_comando_lo_dice(self):
@@ -2770,7 +2797,7 @@ class BandejaMovilTests(_AlmacenMixin, _VentaMixin, TestCase):
         self.pago.refresh_from_db()
         self.pedido.refresh_from_db()
         self.assertEqual(self.pago.estado, Pago.RECHAZADO)
-        self.assertEqual(self.pedido.estado, Pedido.EN_VALIDACION)
+        self.assertEqual(self.pedido.estado, Pedido.CANCELADO)
 
     def test_rechazar_sin_motivo_no_pasa(self):
         self.equipo.post(
@@ -3007,23 +3034,20 @@ class DisponibilidadTests(_CiudadesMixin, TestCase):
 
     def test_un_producto_que_no_viaja_solo_se_retira_donde_esta(self):
         self._viaje()
-        categoria = self.variante.producto.categoria
-        categoria.trasladable = False
-        categoria.save(update_fields=['trasladable'])
+        producto = self.variante.producto
+        producto.no_se_traslada = True
+        producto.save(update_fields=['no_se_traslada'])
 
         self.assertEqual(para_item(self.t40, 1, self.en_hvca)[0], disponibilidad.HOY)
         self.assertEqual(para_item(self.t40, 1, self.en_lircay)[0], disponibilidad.LEJOS)
 
-    def test_el_producto_puede_pisar_a_su_categoria(self):
+    def test_sin_marcar_el_producto_viaja(self):
+        """ La regla es que viaja: solo se marca la excepcion """
         self._viaje()
-        categoria = self.variante.producto.categoria
-        categoria.trasladable = False
-        categoria.save(update_fields=['trasladable'])
-
         producto = self.variante.producto
-        producto.trasladable = True                  # la excepcion puntual
-        producto.save(update_fields=['trasladable'])
 
+        self.assertFalse(producto.no_se_traslada)
+        self.assertTrue(producto.se_traslada)
         self.assertEqual(para_item(self.t40, 1, self.en_lircay)[0], disponibilidad.ENCARGO)
 
     def test_si_ya_hay_stock_en_destino_se_retira_hoy(self):
@@ -3044,8 +3068,8 @@ class DisponibilidadTests(_CiudadesMixin, TestCase):
 
         # una linea viaja y la otra no: el pedido entero no se retira alla
         producto = self.variante.producto
-        producto.trasladable = False
-        producto.save(update_fields=['trasladable'])
+        producto.no_se_traslada = True
+        producto.save(update_fields=['no_se_traslada'])
 
         clave, _ = para_carrito([(self.t40, 1), (self.t41, 1)], self.en_lircay)
         self.assertEqual(clave, disponibilidad.LEJOS)
@@ -3211,3 +3235,1031 @@ class ModuloTransporteTests(_CiudadesMixin, _VentaMixin, TestCase):
         salida = StringIO()
         call_command('programar_transportes', stdout=salida)
         self.assertIn('Todas las ciudades tienen su viaje', salida.getvalue())
+
+
+class BarridoAutomaticoTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """
+    El plazo se cumple con el reloj; pasar el pedido a Cancelado es una escritura
+    y alguien tiene que dispararla. Antes ese alguien era el checkout de otro
+    cliente, la pantalla de pago, o un cron que nadie programo. Ahora tambien lo
+    dispara el trafico normal, cada tanto.
+    """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B090-1', [(self.t40, 2, Decimal('300.00'))], aplicar=True)
+        _cuenta_bcp()
+        cache.clear()
+
+    def _envejecer(self, pedido, minutos=30):
+        Pedido.objects.filter(pk=pedido.pk).update(
+            reserva_vence=timezone.now() - timedelta(minutes=minutos)
+        )
+        pedido.refresh_from_db()
+        return pedido
+
+    def _otro_pedido(self, cantidad=1):
+        otro = Client()
+        otro.post(reverse('web:agregarCarrito'), {
+            'item_id': self.t40.id, 'cantidad': cantidad, 'sku': self.t40.variante.sku,
+        })
+        otro.get(reverse('web:continuarComoInvitado'))
+        otro.post(reverse('web:registrarPedido'), DATOS_CHECKOUT)
+        return Pedido.objects.latest('id')
+
+    def test_navegar_cancela_lo_vencido(self):
+        """ Sin comando, sin checkout ajeno y sin volver a /pago """
+        self._agregar(self.t40, 1)
+        pedido = self._envejecer(self._comprar())
+        cache.clear()                       # ventana de barrido limpia
+
+        self.client.get(reverse('web:index'))
+
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.EXPIRADO)
+        self.assertIn('plazo', pedido.motivo_cancelacion)
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.reservado, 0)
+
+    def test_una_reserva_viva_no_se_toca(self):
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()            # sin envejecer
+        cache.clear()
+
+        self.client.get(reverse('web:index'))
+
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.SOLICITADO)
+
+    def test_no_barre_en_cada_peticion(self):
+        """ Una vez por ventana, no una vez por visita """
+        primero = self._envejecer(self._otro_pedido())
+        cache.clear()
+        self.client.get(reverse('web:index'))
+        primero.refresh_from_db()
+        self.assertEqual(primero.estado, Pedido.EXPIRADO)
+
+        # otro vencido dentro de la misma ventana: todavia no le toca
+        segundo = self._envejecer(self._otro_pedido())
+        self.client.get(reverse('web:index'))
+
+        segundo.refresh_from_db()
+        self.assertEqual(segundo.estado, Pedido.SOLICITADO)
+
+    @override_settings(SEGUNDOS_ENTRE_BARRIDOS=0)
+    def test_se_puede_apagar(self):
+        pedido = self._envejecer(self._otro_pedido())
+        cache.clear()
+
+        self.client.get(reverse('web:index'))
+
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.SOLICITADO)
+
+    def test_un_fallo_barriendo_no_tumba_la_pagina(self):
+        """ El cliente pidio una pagina, no un barrido: si falla, que falle solo """
+        from unittest.mock import patch
+        self._envejecer(self._otro_pedido())
+        cache.clear()
+
+        with patch.object(Pedido, 'vencer_reservas', side_effect=RuntimeError('boom')):
+            respuesta = self.client.get(reverse('web:index'))
+
+        self.assertEqual(respuesta.status_code, 200)
+
+
+class NumeroDePedidoTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """
+    Dos identificadores con dos significados.
+
+    El codigo de reserva dice "estas unidades son de esta persona" y nace al
+    confirmar. El numero de pedido numera una venta y nace con el comprobante.
+    Antes habia uno solo, sacado del id, y cada checkout abandonado se comia un
+    correlativo de la serie.
+    """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B100-1', [(self.t40, 5, Decimal('300.00'))], aplicar=True)
+        self.cuenta = _cuenta_bcp()
+        cache.clear()
+
+    def _declarar(self, pedido, nro='OP-1'):
+        return pedido.declarar_pago(
+            cuenta=self.cuenta, monto_declarado=pedido.monto_total,
+            nro_operacion=nro, voucher=_imagen(), fecha_pago=timezone.localdate(),
+        )
+
+    def test_el_comprobante_emite_el_numero(self):
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+        self.assertIsNone(pedido.nro_pedido)
+
+        self._declarar(pedido)
+
+        pedido.refresh_from_db()
+        self.assertRegex(pedido.nro_pedido, r'^P\d{8}-\d{5}$')
+        self.assertEqual(pedido.estado, Pedido.EN_VALIDACION)
+        self.assertEqual(pedido.referencia, pedido.nro_pedido)
+
+    def test_un_pedido_abandonado_no_gasta_numero(self):
+        """ Lo que motivo el cambio: el carrito que nadie pago no quema serie """
+        self._agregar(self.t40, 1)
+        abandonado = self._comprar()
+        Pedido.objects.filter(pk=abandonado.pk).update(
+            reserva_vence=timezone.now() - timedelta(minutes=30)
+        )
+        Pedido.vencer_reservas()
+
+        abandonado.refresh_from_db()
+        self.assertEqual(abandonado.estado, Pedido.EXPIRADO)
+        self.assertIsNone(abandonado.nro_pedido)
+
+        # el que si paga se lleva el primer numero del dia, sin hueco
+        otro = Client()
+        otro.post(reverse('web:agregarCarrito'), {
+            'item_id': self.t40.id, 'cantidad': 1, 'sku': self.t40.variante.sku,
+        })
+        otro.get(reverse('web:continuarComoInvitado'))
+        otro.post(reverse('web:registrarPedido'), DATOS_CHECKOUT)
+        pagado = Pedido.objects.latest('id')
+        self._declarar(pagado, nro='OP-2')
+
+        pagado.refresh_from_db()
+        self.assertTrue(pagado.nro_pedido.endswith('-00001'))
+
+    def test_el_correlativo_del_dia_no_deja_huecos(self):
+        numeros = []
+        for i in range(3):
+            cliente = Client()
+            cliente.post(reverse('web:agregarCarrito'), {
+                'item_id': self.t40.id, 'cantidad': 1, 'sku': self.t40.variante.sku,
+            })
+            cliente.get(reverse('web:continuarComoInvitado'))
+            cliente.post(reverse('web:registrarPedido'), DATOS_CHECKOUT)
+            pedido = Pedido.objects.latest('id')
+            self._declarar(pedido, nro=f'OP-{i}')
+            pedido.refresh_from_db()
+            numeros.append(pedido.nro_pedido)
+
+        self.assertEqual([n[-5:] for n in numeros], ['00001', '00002', '00003'])
+
+    def test_no_se_reemite_si_ya_tiene_numero(self):
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+        self._declarar(pedido)
+        pedido.refresh_from_db()
+        primero = pedido.nro_pedido
+
+        self.assertEqual(pedido.emitir_nro_pedido(), primero)
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.nro_pedido, primero)
+
+    def test_los_codigos_de_reserva_no_se_repiten(self):
+        codigos = set()
+        for i in range(4):
+            cliente = Client()
+            cliente.post(reverse('web:agregarCarrito'), {
+                'item_id': self.t40.id, 'cantidad': 1, 'sku': self.t40.variante.sku,
+            })
+            cliente.get(reverse('web:continuarComoInvitado'))
+            cliente.post(reverse('web:registrarPedido'), DATOS_CHECKOUT)
+            codigos.add(Pedido.objects.latest('id').codigo_reserva)
+        self.assertEqual(len(codigos), 4)
+
+
+class ValidacionCongelaTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """
+    El plazo de validacion es nuestro y no le quita la unidad a nadie.
+
+    Antes, a las 12 horas de subir el comprobante la unidad volvia al catalogo,
+    otro cliente se la llevaba, y al validar habia que devolver plata. El cliente
+    ya habia hecho su parte: el que tardaba eramos nosotros.
+    """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B110-1', [(self.t40, 1, Decimal('300.00'))], aplicar=True)
+        self.cuenta = _cuenta_bcp()
+        cache.clear()
+
+    def _en_validacion(self):
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+        pedido.declarar_pago(
+            cuenta=self.cuenta, monto_declarado=pedido.monto_total,
+            nro_operacion='OP-CONGELA', voucher=_imagen(), fecha_pago=timezone.localdate(),
+        )
+        pedido.refresh_from_db()
+        return pedido
+
+    def test_la_unidad_no_se_suelta_por_mas_que_pase_el_tiempo(self):
+        pedido = self._en_validacion()
+        # aunque alguien le deje un vencimiento viejo a mano, no vence
+        Pedido.objects.filter(pk=pedido.pk).update(
+            reserva_vence=timezone.now() - timedelta(days=3)
+        )
+
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.disponible, 0)
+        self.assertEqual(Pedido.vencer_reservas(), 0)
+
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.EN_VALIDACION)
+
+    def test_el_barrido_automatico_tampoco_lo_toca(self):
+        pedido = self._en_validacion()
+        Pedido.objects.filter(pk=pedido.pk).update(
+            reserva_vence=timezone.now() - timedelta(days=3)
+        )
+        cache.clear()
+
+        self.client.get(reverse('web:index'))
+
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.EN_VALIDACION)
+
+    def test_la_reserva_sin_comprobante_si_vence(self):
+        """ El arreglo no debe congelar tambien lo que nadie pago """
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+        Pedido.objects.filter(pk=pedido.pk).update(
+            reserva_vence=timezone.now() - timedelta(minutes=30)
+        )
+
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.disponible, 1)
+        self.assertEqual(Pedido.vencer_reservas(), 1)
+
+
+class SeguimientoTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """ Los cuatro pasos que ve el cliente, al estilo de cualquier tienda """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B120-1', [(self.t40, 4, Decimal('300.00'))], aplicar=True)
+        self.cuenta = _cuenta_bcp()
+        cache.clear()
+
+    def _pedido_en(self, estado, recojo=False):
+        sufijo = 'R' if recojo else 'E'
+        return Pedido.objects.create(
+            codigo_reserva='R-SEG' + estado + sufijo,
+            nombre_comprador='Ana', apellido_comprador='Perez',
+            email_comprador='a@b.pe', telefono_comprador='999',
+            modo_entrega=Pedido.RECOJO if recojo else Pedido.ENVIO,
+            monto_total=Decimal('100.00'), estado=estado,
+        )
+
+    def test_una_reserva_no_muestra_seguimiento(self):
+        """ Todavia no es un pedido: un paso 1 le prometeria algo que no compro """
+        self.assertEqual(self._pedido_en(Pedido.SOLICITADO).pasos_seguimiento, [])
+
+    def test_un_cancelado_no_muestra_seguimiento(self):
+        self.assertEqual(self._pedido_en(Pedido.CANCELADO).pasos_seguimiento, [])
+
+    def test_en_validacion_es_el_primer_paso(self):
+        pasos = self._pedido_en(Pedido.EN_VALIDACION).pasos_seguimiento
+        self.assertEqual([p['nombre'] for p in pasos],
+                         ['Recibido', 'Confirmado', 'Enviado', 'Entregado'])
+        self.assertTrue(pasos[0]['actual'])
+        self.assertFalse(any(p['hecho'] for p in pasos))
+
+    def test_el_recojo_cambia_el_tercer_paso(self):
+        pasos = self._pedido_en(Pedido.PAGADO, recojo=True).pasos_seguimiento
+        self.assertEqual(pasos[2]['nombre'], 'Listo para recoger')
+        self.assertTrue(pasos[0]['hecho'])
+        self.assertTrue(pasos[1]['actual'])
+
+    def test_entregado_completa_los_cuatro(self):
+        pasos = self._pedido_en(Pedido.ENTREGADO).pasos_seguimiento
+        self.assertTrue(pasos[3]['actual'])
+        self.assertEqual(sum(1 for p in pasos if p['hecho']), 3)
+
+    def test_la_pantalla_pinta_los_pasos(self):
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+        pedido.declarar_pago(
+            cuenta=self.cuenta, monto_declarado=pedido.monto_total,
+            nro_operacion='OP-SEG', voucher=_imagen(), fecha_pago=timezone.localdate(),
+        )
+
+        respuesta = self.client.get(reverse('web:gracias'))
+        self.assertContains(respuesta, 'seg-actual')
+        self.assertContains(respuesta, 'Recibido')
+        self.assertContains(respuesta, 'Entregado')
+
+
+class WhatsappTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """ Lo que una pantalla no resuelve lo atiende una persona """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B130-1', [(self.t40, 2, Decimal('300.00'))], aplicar=True)
+        _cuenta_bcp()
+        cache.clear()
+
+    def test_pago_ofrece_al_asesor_con_el_pedido_escrito(self):
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+
+        respuesta = self.client.get(reverse('web:pagoPedido'))
+        self.assertContains(respuesta, 'wa.me/' + settings.WHATSAPP_ASESOR)
+        self.assertContains(respuesta, 'Escribinos por WhatsApp')
+        self.assertIn(pedido.referencia, respuesta.context['whatsapp'])
+
+    def test_gracias_tambien_ofrece_al_asesor(self):
+        self._agregar(self.t40, 1)
+        self._comprar()
+
+        respuesta = self.client.get(reverse('web:gracias'))
+        self.assertContains(respuesta, 'wa.me/' + settings.WHATSAPP_ASESOR)
+
+    @override_settings(WHATSAPP_ASESOR='')
+    def test_sin_numero_configurado_no_se_muestra(self):
+        self._agregar(self.t40, 1)
+        self._comprar()
+
+        respuesta = self.client.get(reverse('web:pagoPedido'))
+        self.assertEqual(respuesta.context['whatsapp'], '')
+        self.assertNotContains(respuesta, 'Escribinos por WhatsApp')
+
+
+class RechazoLiberaInventarioTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """
+    Rechazar un comprobante devuelve la unidad al catalogo.
+
+    Con la validacion sin vencimiento, un pedido rechazado que se quedaba
+    abierto congelaba su unidad para siempre: nada lo barria nunca.
+    """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B140-1', [(self.t40, 1, Decimal('300.00'))], aplicar=True)
+        self.cuenta = _cuenta_bcp()
+        cache.clear()
+
+    def _en_validacion(self):
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+        pago = pedido.declarar_pago(
+            cuenta=self.cuenta, monto_declarado=pedido.monto_total,
+            nro_operacion='OP-RECH', voucher=_imagen(), fecha_pago=timezone.localdate(),
+        )
+        pedido.refresh_from_db()
+        return pedido, pago
+
+    def test_la_unidad_vuelve_al_catalogo(self):
+        pedido, pago = self._en_validacion()
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.disponible, 0)
+
+        pago.rechazar('El monto no coincide')
+
+        pedido.refresh_from_db()
+        self.t40.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.CANCELADO)
+        self.assertEqual(self.t40.reservado, 0)
+        self.assertEqual(self.t40.disponible, 1)
+        self.assertEqual(self.t40.stock, 1)      # nunca salio del estante
+
+    def test_otro_cliente_puede_comprarla_enseguida(self):
+        _, pago = self._en_validacion()
+        pago.rechazar('Captura ilegible')
+
+        otro = Client()
+        otro.post(reverse('web:agregarCarrito'), {
+            'item_id': self.t40.id, 'cantidad': 1, 'sku': self.t40.variante.sku,
+        })
+        otro.get(reverse('web:continuarComoInvitado'))
+        otro.post(reverse('web:registrarPedido'), DATOS_CHECKOUT)
+
+        self.assertEqual(Pedido.objects.filter(estado=Pedido.SOLICITADO).count(), 1)
+
+    def test_el_pedido_conserva_su_numero(self):
+        """ Un numero emitido no se devuelve, aunque el pedido termine cancelado """
+        pedido, pago = self._en_validacion()
+        numero = pedido.nro_pedido
+        self.assertIsNotNone(numero)
+
+        pago.rechazar('El monto no coincide')
+
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.nro_pedido, numero)
+
+class IdempotenciaCheckoutTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """
+    Apretar Confirmar diez veces tiene que dar lo mismo que apretarlo una.
+
+    El bloqueo de filas ya impedia que dos clientes se llevaran la misma unidad,
+    pero no que un cliente se llevara dos pedidos: con stock de sobra, el
+    segundo clic reservaba otro par y creaba un pedido fantasma que retenia
+    inventario hasta vencer.
+    """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B150-1', [(self.t40, 5, Decimal('300.00'))], aplicar=True)
+        _cuenta_bcp()
+        cache.clear()
+
+    def _confirmar_con(self, token, cliente=None):
+        cliente = cliente or self.client
+        datos = dict(DATOS_CHECKOUT, token_checkout=token)
+        return cliente.post(reverse('web:registrarPedido'), datos)
+
+    def _preparar(self):
+        self._agregar(self.t40, 1)
+        self.client.get(reverse('web:continuarComoInvitado'))
+
+    # --- el caso que motivo el cambio ---
+
+    def test_dos_envios_con_el_mismo_token_dan_un_solo_pedido(self):
+        self._preparar()
+        self._confirmar_con('tok-doble-clic')
+
+        # el carrito quedo vacio, asi que el segundo envio ni llega a crear:
+        # se prueba directo contra el servicio, que es donde vive la garantia
+        self.assertEqual(Pedido.objects.count(), 1)
+        primero = Pedido.objects.get()
+        self.assertEqual(primero.token_checkout, 'tok-doble-clic')
+
+    def test_el_servicio_devuelve_el_pedido_ya_creado(self):
+        """ El corazon del asunto: mismo token, mismo pedido, no uno nuevo """
+        self._preparar()
+        self._confirmar_con('tok-repetido')
+        primero = Pedido.objects.get()
+
+        # el cliente vuelve a cargar el carrito y reenvia el mismo formulario
+        # (la marca de invitado se consume al confirmar, asi que se re-identifica)
+        self._agregar(self.t40, 1)
+        self.client.get(reverse('web:continuarComoInvitado'))
+        respuesta = self._confirmar_con('tok-repetido')
+
+        self.assertEqual(Pedido.objects.count(), 1)
+        self.assertEqual(Pedido.objects.get().pk, primero.pk)
+        self.assertEqual(respuesta.status_code, 302)
+        self.assertIn('pago', respuesta.url)
+
+    def test_el_segundo_envio_no_reserva_otra_unidad(self):
+        self._preparar()
+        self._confirmar_con('tok-una-sola')
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.reservado, 1)
+
+        self._agregar(self.t40, 1)
+        self._confirmar_con('tok-una-sola')
+
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.reservado, 1)     # sigue siendo una
+
+    def test_tokens_distintos_son_compras_distintas(self):
+        """ Comprar dos veces a proposito tiene que seguir funcionando """
+        self._preparar()
+        self._confirmar_con('tok-compra-1')
+
+        self._agregar(self.t40, 1)
+        self.client.get(reverse('web:continuarComoInvitado'))
+        self._confirmar_con('tok-compra-2')
+
+        self.assertEqual(Pedido.objects.count(), 2)
+
+    def test_sin_token_se_compra_igual(self):
+        """ Una pagina vieja, sin el campo, no puede quedarse sin comprar """
+        self._preparar()
+        self.client.post(reverse('web:registrarPedido'), DATOS_CHECKOUT)
+
+        self.assertEqual(Pedido.objects.count(), 1)
+        self.assertIsNone(Pedido.objects.get().token_checkout)
+
+    # --- la carrera de verdad, contra el unique de la base ---
+
+    def test_el_empate_lo_resuelve_la_base(self):
+        """
+        Los dos envios pasan el atajo y llegan a crear. El unique deja pasar
+        uno; el que pierde devuelve el del ganador en vez de reventar.
+        """
+        from web.pedidos import _crear_cabecera
+
+        comunes = dict(
+            nombre_comprador='Ana', apellido_comprador='Perez',
+            email_comprador='a@b.pe', telefono_comprador='999',
+            modo_entrega=Pedido.ENVIO, monto_total=Decimal('100.00'),
+        )
+        ganador, cree_el_primero = _crear_cabecera(token='tok-empate', **comunes)
+        perdedor, cree_el_segundo = _crear_cabecera(token='tok-empate', **comunes)
+
+        self.assertTrue(cree_el_primero)
+        self.assertFalse(cree_el_segundo)     # y eso es la orden de abandonar
+        self.assertEqual(perdedor.pk, ganador.pk)
+        self.assertEqual(Pedido.objects.filter(token_checkout='tok-empate').count(), 1)
+
+    def test_un_choque_por_otra_cosa_no_se_traga(self):
+        """ Solo se recupera del choque de token: los demas tienen que doler """
+        from web.pedidos import _crear_cabecera
+
+        comunes = dict(
+            nombre_comprador='Ana', apellido_comprador='Perez',
+            email_comprador='a@b.pe', telefono_comprador='999',
+            modo_entrega=Pedido.ENVIO, monto_total=Decimal('100.00'),
+        )
+        _crear_cabecera(token=None, codigo_reserva='R-CHOQUE01', **comunes)
+        with self.assertRaises(IntegrityError):
+            _crear_cabecera(token=None, codigo_reserva='R-CHOQUE01', **comunes)
+
+    def test_el_perdedor_de_la_carrera_no_duplica_lineas(self):
+        """
+        Regresion. El envio que pierde recibe el pedido del ganador. Si en vez
+        de abandonar sigue adelante, le agrega sus lineas y sus reservas encima:
+        un solo pedido, con el doble de todo. Los tests no lo agarraron; lo
+        agarro mandar dos POST de verdad contra el servidor.
+        """
+        from unittest.mock import patch
+
+        self._preparar()
+        self._confirmar_con('tok-ganador')
+        ganador = Pedido.objects.get()
+        self.t40.refresh_from_db()
+        self.assertEqual(ganador.detalles.count(), 1)
+        self.assertEqual(self.t40.reservado, 1)
+
+        # el perdedor llega hasta crear la cabecera y recibe la del ganador
+        self._agregar(self.t40, 1)
+        self.client.get(reverse('web:continuarComoInvitado'))
+        with patch('web.pedidos._crear_cabecera', return_value=(ganador, False)):
+            self._confirmar_con('tok-del-perdedor')
+
+        ganador.refresh_from_db()
+        self.t40.refresh_from_db()
+        self.assertEqual(ganador.detalles.count(), 1)    # sigue con una linea
+        self.assertEqual(self.t40.reservado, 1)          # y una sola reserva
+        self.assertEqual(Pedido.objects.count(), 1)
+
+    # --- la pantalla ---
+
+    def test_el_formulario_pinta_el_token(self):
+        self._agregar(self.t40, 1)
+        self.client.get(reverse('web:continuarComoInvitado'))
+        respuesta = self.client.get(reverse('web:registrarPedido'))
+
+        self.assertContains(respuesta, 'name="token_checkout"')
+        self.assertContains(respuesta, 'type="hidden"')
+        token = respuesta.context['frmPedido'].initial['token_checkout']
+        self.assertEqual(len(token), 32)
+
+    def test_cada_visita_trae_un_token_distinto(self):
+        self._agregar(self.t40, 1)
+        self.client.get(reverse('web:continuarComoInvitado'))
+        uno = self.client.get(reverse('web:registrarPedido'))
+        otro = self.client.get(reverse('web:registrarPedido'))
+
+        self.assertNotEqual(uno.context['frmPedido'].initial['token_checkout'],
+                            otro.context['frmPedido'].initial['token_checkout'])
+
+
+class MensajesDeTransicionTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """
+    Un error tiene que sennalar lo que esta mal, no lo primero que no encaja.
+
+    "Un pedido pagado no puede pasar a listo para recojo" manda a mirar el
+    estado, y el estado esta bien: desde pagado se avanza sin problema. Lo que
+    no encaja es que sea un pedido con envio a domicilio.
+    """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B160-1', [(self.t40, 4, Decimal('300.00'))], aplicar=True)
+        _cuenta_bcp()
+        cache.clear()
+
+    def _pagado(self, recojo=False):
+        return Pedido.objects.create(
+            codigo_reserva='R-MSG' + ('R' if recojo else 'E'),
+            nombre_comprador='Ana', apellido_comprador='Perez',
+            email_comprador='a@b.pe', telefono_comprador='999',
+            modo_entrega=Pedido.RECOJO if recojo else Pedido.ENVIO,
+            monto_total=Decimal('100.00'), estado=Pedido.PAGADO,
+        )
+
+    def test_el_error_culpa_al_modo_de_entrega_y_no_al_estado(self):
+        pedido = self._pagado(recojo=False)
+
+        with self.assertRaises(ValueError) as caso:
+            pedido.cambiar_estado(Pedido.LISTO_RECOJO)
+
+        mensaje = str(caso.exception)
+        self.assertIn('envio a domicilio', mensaje)
+        self.assertIn('listo para recojo', mensaje)
+        self.assertNotIn('Un pedido pagado', mensaje)
+
+    def test_tambien_al_reves(self):
+        pedido = self._pagado(recojo=True)
+
+        with self.assertRaises(ValueError) as caso:
+            pedido.cambiar_estado(Pedido.ENVIADO)
+
+        self.assertIn('recojo en tienda', str(caso.exception))
+
+    def test_el_mensaje_dice_que_corresponde_hacer(self):
+        pedido = self._pagado(recojo=False)
+
+        with self.assertRaises(ValueError) as caso:
+            pedido.cambiar_estado(Pedido.LISTO_RECOJO)
+
+        self.assertIn('enviado', str(caso.exception).lower())
+
+    def test_cuando_el_estado_si_es_el_problema_lo_dice(self):
+        """ El mensaje viejo sigue vivo donde de verdad corresponde """
+        pedido = self._pagado(recojo=False)
+        pedido.cambiar_estado(Pedido.ENVIADO)
+        pedido.cambiar_estado(Pedido.ENTREGADO)
+
+        with self.assertRaises(ValueError) as caso:
+            pedido.cambiar_estado(Pedido.ENVIADO)
+
+        self.assertIn('entregado', str(caso.exception).lower())
+
+
+class CarritoAvisaFaltantesTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """
+    El carrito vive en la sesion y no sabe nada del almacen.
+
+    Una linea puede pasar horas ahi mientras otro cliente se lleva la ultima
+    unidad. Antes eso se descubria en el checkout, con el formulario ya lleno.
+    """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B170-1', [(self.t40, 1, Decimal('300.00'))], aplicar=True)
+        self.cuenta = _cuenta_bcp()
+        cache.clear()
+
+    def _otro_se_la_lleva(self):
+        """ Otro cliente compra la unica unidad y sube su comprobante """
+        otro = Client()
+        otro.post(reverse('web:agregarCarrito'), {
+            'item_id': self.t40.id, 'cantidad': 1, 'sku': self.t40.variante.sku,
+        })
+        otro.get(reverse('web:continuarComoInvitado'))
+        otro.post(reverse('web:registrarPedido'), DATOS_CHECKOUT)
+        pedido = Pedido.objects.latest('id')
+        pedido.declarar_pago(
+            cuenta=self.cuenta, monto_declarado=pedido.monto_total,
+            nro_operacion='OP-GANADOR', voucher=_imagen(), fecha_pago=timezone.localdate(),
+        )
+        return pedido
+
+    def test_avisa_que_el_producto_se_agoto(self):
+        self._agregar(self.t40, 1)
+        self._otro_se_la_lleva()
+
+        respuesta = self.client.get(reverse('web:carrito'))
+
+        self.assertTrue(respuesta.context['hay_fallas'])
+        self.assertContains(respuesta, 'se agoto')
+        self.assertContains(respuesta, 'Quitalo del carrito para continuar')
+
+    def test_frena_el_boton_de_realizar_pedido(self):
+        self._agregar(self.t40, 1)
+        self._otro_se_la_lleva()
+
+        respuesta = self.client.get(reverse('web:carrito'))
+
+        # aria-disabled solo existe en el marcado; boton-inerte tambien esta en el CSS
+        self.assertContains(respuesta, 'aria-disabled="true"')
+        self.assertNotContains(respuesta, reverse('web:identificarse'))
+
+    def test_ofrece_el_asesor_por_si_ya_pago(self):
+        self._agregar(self.t40, 1)
+        self._otro_se_la_lleva()
+
+        respuesta = self.client.get(reverse('web:carrito'))
+        self.assertContains(respuesta, 'wa.me/' + settings.WHATSAPP_ASESOR)
+
+    def test_un_carrito_sano_no_muestra_nada_de_esto(self):
+        self._agregar(self.t40, 1)
+
+        respuesta = self.client.get(reverse('web:carrito'))
+
+        self.assertFalse(respuesta.context['hay_fallas'])
+        self.assertNotContains(respuesta, 'aria-disabled="true"')
+        self.assertContains(respuesta, reverse('web:identificarse'))
+
+    def test_avisa_cuando_quedan_menos_de_las_que_pidio(self):
+        self._compra('B170-2', [(self.t41, 3, Decimal('300.00'))], aplicar=True)
+        self.t41.refresh_from_db()
+        self._agregar(self.t41, 3)
+
+        # otro cliente se lleva dos
+        otro = Client()
+        otro.post(reverse('web:agregarCarrito'), {
+            'item_id': self.t41.id, 'cantidad': 2, 'sku': self.t41.variante.sku,
+        })
+        otro.get(reverse('web:continuarComoInvitado'))
+        otro.post(reverse('web:registrarPedido'), DATOS_CHECKOUT)
+
+        respuesta = self.client.get(reverse('web:carrito'))
+        self.assertContains(respuesta, 'solo queda')
+
+    def test_la_reserva_restaurada_conserva_la_cantidad(self):
+        """ Volvieron dos unidades, no una """
+        self._compra('B170-3', [(self.t41, 2, Decimal('300.00'))], aplicar=True)
+        self.t41.refresh_from_db()
+        self._agregar(self.t41, 2)
+        pedido = self._comprar()
+        Pedido.objects.filter(pk=pedido.pk).update(
+            reserva_vence=timezone.now() - timedelta(minutes=30)
+        )
+
+        self.client.get(reverse('web:pagoPedido'))
+
+        lineas = self.client.session['cart'].values()
+        self.assertEqual(sum(l['cantidad'] for l in lineas), 2)
+
+
+class EstadoExpiradoTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """
+    Se le acabo el tiempo no es lo mismo que lo cancelaron.
+
+    Los dos terminaban en CANCELADO y solo los separaba el texto del motivo.
+    Filtrar por texto libre no sirve para contar, y sin contar cuantas reservas
+    se caen solas no hay forma de saber si el plazo esta bien puesto.
+    """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B180-1', [(self.t40, 2, Decimal('300.00'))], aplicar=True)
+        self.cuenta = _cuenta_bcp()
+        cache.clear()
+
+    def _envejecer(self, pedido, minutos=30):
+        Pedido.objects.filter(pk=pedido.pk).update(
+            reserva_vence=timezone.now() - timedelta(minutes=minutos)
+        )
+        pedido.refresh_from_db()
+        return pedido
+
+    # --- los dos finales, separados ---
+
+    def test_el_plazo_vencido_expira_no_cancela(self):
+        self._agregar(self.t40, 1)
+        pedido = self._envejecer(self._comprar())
+
+        Pedido.vencer_reservas()
+
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.EXPIRADO)
+        self.assertNotEqual(pedido.estado, Pedido.CANCELADO)
+
+    def test_el_rechazo_cancela_no_expira(self):
+        """ Ese lo cerramos nosotros, y se cuenta aparte """
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+        pago = pedido.declarar_pago(
+            cuenta=self.cuenta, monto_declarado=pedido.monto_total,
+            nro_operacion='OP-EXP-1', voucher=_imagen(), fecha_pago=timezone.localdate(),
+        )
+        pago.rechazar('El monto no coincide')
+
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.CANCELADO)
+
+    def test_se_pueden_contar_por_separado(self):
+        """ Lo que motiva el estado: poder medir """
+        self._agregar(self.t40, 1)
+        self._envejecer(self._comprar())
+        Pedido.vencer_reservas()
+
+        self._agregar(self.t40, 1)
+        otro = self._comprar()
+        otro.cancelar('Me arrepenti')
+
+        self.assertEqual(Pedido.objects.filter(estado=Pedido.EXPIRADO).count(), 1)
+        self.assertEqual(Pedido.objects.filter(estado=Pedido.CANCELADO).count(), 1)
+
+    # --- expirar hace el mismo trabajo sucio que cancelar ---
+
+    def test_expirar_suelta_las_unidades(self):
+        self._agregar(self.t40, 2)
+        pedido = self._envejecer(self._comprar())
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.reservado, 2)
+
+        pedido.expirar()
+
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.reservado, 0)
+        self.assertEqual(self.t40.disponible, 2)
+        self.assertEqual(self.t40.stock, 2)      # nunca salio del estante
+
+    def test_un_expirado_no_se_vuelve_a_cerrar(self):
+        self._agregar(self.t40, 1)
+        pedido = self._envejecer(self._comprar())
+        pedido.expirar()
+
+        with self.assertRaises(ValueError) as caso:
+            pedido.cancelar('Otra vez')
+        self.assertIn('expirado', str(caso.exception).lower())
+
+    def test_un_expirado_no_muestra_seguimiento(self):
+        self._agregar(self.t40, 1)
+        pedido = self._envejecer(self._comprar())
+        pedido.expirar()
+
+        self.assertEqual(pedido.pasos_seguimiento, [])
+
+    # --- el hueco que motivo todo esto ---
+
+    def test_si_el_barrido_llego_primero_igual_recupera_su_carrito(self):
+        """
+        Regresion. La vista preguntaba "se acaba de vencer?" en vez de "murio?".
+        Como el barrido corre cada minuto, casi siempre llegaba antes y el
+        cliente volvia a /pago sin que le devolvieran nada.
+        """
+        self._agregar(self.t40, 2)
+        pedido = self._envejecer(self._comprar())
+
+        # el barrido pasa primero, como pasa casi siempre en la vida real
+        Pedido.vencer_reservas()
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.EXPIRADO)
+        self.assertIsNone(pedido.reserva_vence)
+        self.assertFalse(pedido.reserva_vencida)     # ya no "se acaba de vencer"
+
+        respuesta = self.client.get(reverse('web:pagoPedido'))
+
+        self.assertRedirects(respuesta, reverse('web:carrito'))
+        lineas = self.client.session['cart'].values()
+        self.assertEqual(sum(l['cantidad'] for l in lineas), 2)
+
+
+class PedidoMuertoNoAdmiteComprobantesTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """
+    Un comprobante solo existe sobre un pedido vivo.
+
+    Antes se aceptaba igual y se marcaba `fuera_de_plazo`, para que el sistema
+    despues intentara resucitar el pedido. Sin esa resurreccion, aceptarlo solo
+    creaba un pago que nadie podia procesar: ni validar ni cumplir. Ahora el
+    cliente rehace la compra y sube el mismo voucher sobre el pedido nuevo.
+    """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B190-1', [(self.t40, 2, Decimal('300.00'))], aplicar=True)
+        self.cuenta = _cuenta_bcp()
+        cache.clear()
+
+    def _declarar(self, pedido, nro='OP-MUERTO'):
+        return pedido.declarar_pago(
+            cuenta=self.cuenta, monto_declarado=pedido.monto_total,
+            nro_operacion=nro, voucher=_imagen(), fecha_pago=timezone.localdate(),
+        )
+
+    def _muerto(self, expirado=True):
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+        if expirado:
+            Pedido.objects.filter(pk=pedido.pk).update(
+                reserva_vence=timezone.now() - timedelta(minutes=30)
+            )
+            Pedido.vencer_reservas()
+        else:
+            self._declarar(pedido, nro='OP-PRIMERO').rechazar('Captura ilegible')
+        pedido.refresh_from_db()
+        return pedido
+
+    def test_un_expirado_no_admite_comprobante(self):
+        pedido = self._muerto(expirado=True)
+        self.assertEqual(pedido.estado, Pedido.EXPIRADO)
+
+        with self.assertRaises(ValueError) as caso:
+            self._declarar(pedido)
+        self.assertIn('rehacer la compra', str(caso.exception))
+
+    def test_un_cancelado_tampoco(self):
+        pedido = self._muerto(expirado=False)
+        self.assertEqual(pedido.estado, Pedido.CANCELADO)
+
+        with self.assertRaises(ValueError) as caso:
+            self._declarar(pedido, nro='OP-SEGUNDO')
+        self.assertIn('rehacer la compra', str(caso.exception))
+
+    def test_no_queda_ningun_pago_colgado(self):
+        """ Lo que se evita: pagos en la bandeja que nadie puede resolver """
+        pedido = self._muerto(expirado=True)
+        with self.assertRaises(ValueError):
+            self._declarar(pedido)
+
+        self.assertEqual(pedido.pagos.count(), 0)
+
+    def test_un_pedido_vivo_si_lo_admite(self):
+        """ La regla corta lo muerto, no lo normal """
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+
+        pago = self._declarar(pedido, nro='OP-VIVO')
+
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.EN_VALIDACION)
+        self.assertEqual(pago.estado, Pago.PENDIENTE)
+
+    def test_el_camino_bueno_es_rehacer_la_compra(self):
+        """
+        Al cliente no se le cierra la puerta: compra de nuevo con la unidad ya
+        liberada y sube el mismo voucher sobre el pedido nuevo.
+        """
+        self._muerto(expirado=True)
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.disponible, 2)     # la unidad volvio
+
+        self._agregar(self.t40, 1)
+        self.client.get(reverse('web:continuarComoInvitado'))
+        self.client.post(reverse('web:registrarPedido'), DATOS_CHECKOUT)
+        nuevo = Pedido.objects.latest('id')
+
+        self._declarar(nuevo, nro='OP-MISMO-VOUCHER').validar(nuevo.monto_total)
+
+        nuevo.refresh_from_db()
+        self.t40.refresh_from_db()
+        self.assertEqual(nuevo.estado, Pedido.PAGADO)
+        self.assertEqual(self.t40.stock, 1)          # se vendio de verdad
+
+    def test_la_pantalla_de_pago_lo_manda_al_carrito(self):
+        """ El cliente no ve un formulario inutil: ve su carrito de vuelta """
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+        self._declarar(pedido, nro='OP-RECHAZADO').rechazar('El monto no coincide')
+
+        respuesta = self.client.get(reverse('web:pagoPedido'), follow=True)
+
+        self.assertRedirects(respuesta, reverse('web:carrito'))
+        self.assertContains(respuesta, 'No pudimos confirmar tu pago')
+        lineas = self.client.session['cart'].values()
+        self.assertEqual(sum(l['cantidad'] for l in lineas), 1)
+
+
+class ContadorNoSeAdelantaTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """
+    El contador llegaba a cero antes que el servidor y la pantalla se moria.
+
+    `int()` truncaba, asi que el navegador siempre arrancaba por debajo del
+    tiempo real: su cuenta terminaba mientras el servidor todavia daba la
+    reserva por viva. Recargaba, el servidor no lo mandaba a ningun lado, y como
+    la plantilla trataba el cero como "no hay reloj", la pagina quedaba quieta
+    con el producto retenido hasta que alguien la refrescara a mano.
+    """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B200-1', [(self.t40, 2, Decimal('300.00'))], aplicar=True)
+        _cuenta_bcp()
+        cache.clear()
+
+    def _con_vencimiento_en(self, segundos):
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+        Pedido.objects.filter(pk=pedido.pk).update(
+            reserva_vence=timezone.now() + timedelta(seconds=segundos)
+        )
+        pedido.refresh_from_db()
+        return pedido
+
+    def test_una_fraccion_de_segundo_cuenta_como_uno(self):
+        """ Truncando daba 0 con la reserva todavia viva: ahi nacia el cuelgue """
+        pedido = self._con_vencimiento_en(0.6)
+
+        self.assertFalse(pedido.reserva_vencida)
+        self.assertEqual(pedido.segundos_restantes, 1)
+
+    def test_el_reloj_nunca_llega_a_cero_antes_que_el_servidor(self):
+        """ Mientras la reserva este viva, el contador tiene que mostrar algo """
+        for fraccion in (0.1, 0.5, 0.9, 1.4, 59.2):
+            pedido = self._con_vencimiento_en(fraccion)
+            self.assertFalse(pedido.reserva_vencida, fraccion)
+            self.assertGreater(pedido.segundos_restantes, 0, fraccion)
+            pedido.cancelar('limpieza del test')
+
+    def test_la_pantalla_pinta_el_reloj_aunque_quede_poco(self):
+        self._con_vencimiento_en(0.6)
+
+        respuesta = self.client.get(reverse('web:pagoPedido'))
+
+        self.assertEqual(respuesta.status_code, 200)
+        self.assertContains(respuesta, 'pg-reloj')
+        self.assertContains(respuesta, 'data-segundos="1"')
+
+    def test_ya_vencido_no_pinta_reloj_porque_se_va_al_carrito(self):
+        pedido = self._con_vencimiento_en(-30)
+
+        respuesta = self.client.get(reverse('web:pagoPedido'))
+
+        self.assertRedirects(respuesta, reverse('web:carrito'))
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.EXPIRADO)
+
+    def test_el_plazo_completo_no_pierde_el_ultimo_segundo(self):
+        self._agregar(self.t40, 1)
+        pedido = self._comprar()
+
+        # con truncado daba MINUTOS_RESERVA*60 - 1; ahora llega al valor entero
+        self.assertEqual(pedido.segundos_restantes, settings.MINUTOS_RESERVA * 60)

@@ -15,8 +15,9 @@
 </p>
 {% endif %}
 
-<form method="post" action="{% url 'web:registrarPedido' %}" class="checkout">
+<form method="post" action="{% url 'web:registrarPedido' %}" class="checkout" id="frm-checkout">
     {% csrf_token %}
+    {{ frmPedido.token_checkout }}
 
     <div class="checkout-grid">
         <div class="checkout-datos">
@@ -379,6 +380,20 @@
     modos.forEach(function (radio) {
         radio.addEventListener('change', function () { mostrar(radio.value); });
         if (radio.checked) mostrar(radio.value);
+    });
+})();
+
+// El doble clic ya no duplica el pedido: de eso se encarga el token del
+// formulario. Esto es lo otro que hace falta -- decirle al cliente que su clic
+// llego, para que no lo repita mirando un boton que no reacciona.
+(function () {
+    var form = document.getElementById('frm-checkout');
+    if (!form) return;
+    var boton = form.querySelector('.boton-confirmar');
+    form.addEventListener('submit', function () {
+        if (!boton) return;
+        boton.disabled = true;
+        boton.textContent = 'Confirmando...';
     });
 })();
 </script>

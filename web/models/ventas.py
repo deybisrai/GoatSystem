@@ -1,14 +1,26 @@
 """ Ventas: pedidos del canal online (stock que sale) """
 
 from datetime import timedelta
+from math import ceil
+from uuid import uuid4
 
 from django.conf import settings
-from django.db import models, transaction
+from django.db import IntegrityError, models, transaction
 from django.utils import timezone
 
 from ..avisos import avisar_pago_declarado
 from .inventario import Inventario
 from .kardex import MovimientoInventario
+
+
+def codigo_de_reserva():
+    """
+    Identificador de una reserva, no de una venta.
+
+    Nace con el pedido y no es correlativo a proposito: un carrito abandonado no
+    tiene por que gastarse un numero de la serie. Se lo puede leer por telefono.
+    """
+    return f'R-{uuid4().hex[:8].upper()}'
 
 
 class Pedido(models.Model):
@@ -23,6 +35,11 @@ class Pedido(models.Model):
     # definen las TRANSICIONES, no el valor del codigo.
     EN_VALIDACION = '5'
     LISTO_RECOJO = '6'
+    # Se le acabo el tiempo, que no es lo mismo que lo cancelaron. Un expirado
+    # es un cliente que no llego; un cancelado es una decision de alguien. Sin
+    # separarlos no se puede medir cuantas reservas se caen solas, que es el
+    # unico numero que dice si el plazo esta bien puesto.
+    EXPIRADO = '7'
 
     ESTADO_CHOICES = (
         (SOLICITADO, 'Solicitado'),
@@ -31,6 +48,7 @@ class Pedido(models.Model):
         (ENVIADO, 'Enviado'),
         (LISTO_RECOJO, 'Listo para recojo'),
         (ENTREGADO, 'Entregado'),
+        (EXPIRADO, 'Expirado'),
         (CANCELADO, 'Cancelado'),
     )
 
@@ -45,12 +63,14 @@ class Pedido(models.Model):
     # "envia", queda listo en el mostrador. Solo avanza, y ni entregado ni
     # cancelado se mueven.
     TRANSICIONES = {
-        SOLICITADO: (EN_VALIDACION, CANCELADO),
+        # solo una reserva expira: con el comprobante arriba ya no corre reloj
+        SOLICITADO: (EN_VALIDACION, EXPIRADO, CANCELADO),
         EN_VALIDACION: (PAGADO, CANCELADO),
         PAGADO: (ENVIADO, CANCELADO),
         ENVIADO: (ENTREGADO, CANCELADO),
         LISTO_RECOJO: (ENTREGADO, CANCELADO),
         ENTREGADO: (),
+        EXPIRADO: (),
         CANCELADO: (),
     }
 
@@ -68,7 +88,28 @@ class Pedido(models.Model):
     telefono_comprador = models.CharField(max_length=20)
     dni_comprador = models.CharField(max_length=8, blank=True)
 
-    nro_pedido = models.CharField(max_length=20, unique=True)
+    # dos identificadores, y la diferencia importa: el codigo de reserva nace
+    # con el pedido y solo dice "estas unidades son de esta persona"; el numero
+    # de pedido nace con el comprobante y numera una venta de verdad. Un
+    # checkout abandonado se lleva un codigo, nunca un numero.
+    codigo_reserva = models.CharField(
+        max_length=20, unique=True, default=codigo_de_reserva, editable=False,
+        help_text='Identifica la reserva desde que se confirma el pedido.',
+    )
+    nro_pedido = models.CharField(
+        max_length=20, unique=True, null=True, blank=True,
+        help_text='Correlativo de la venta. Se emite al recibir el comprobante.',
+    )
+    # El identificador del CLIC, no del pedido ni del producto. El bloqueo de
+    # filas impide que dos clientes se lleven la misma unidad; esto impide que
+    # un cliente se lleve dos pedidos por apretar dos veces. Son problemas
+    # distintos. La garantia la da el unique de la base y no una consulta
+    # previa: entre consultar y crear hay una rendija, que es justo el caso que
+    # queremos cerrar.
+    token_checkout = models.CharField(
+        max_length=32, unique=True, null=True, blank=True, editable=False,
+        help_text='Identifica el envio del formulario, para no duplicar el pedido.',
+    )
     monto_total = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     estado = models.CharField(max_length=1, default=SOLICITADO, choices=ESTADO_CHOICES)
     fecha_registro = models.DateTimeField(auto_now_add=True)
@@ -104,8 +145,76 @@ class Pedido(models.Model):
     # deja de ser suyo y pasa a ser nuestro para revisarlo.
     reserva_vence = models.DateTimeField(null=True, blank=True)
 
+    # Los cuatro pasos que ve el cliente, al estilo de cualquier tienda. La
+    # reserva no aparece: todavia no es un pedido, y mostrarla como "paso 0"
+    # le prometeria un avance que no compro.
+    SEGUIMIENTO = {
+        EN_VALIDACION: 1,
+        PAGADO: 2,
+        ENVIADO: 3,
+        LISTO_RECOJO: 3,
+        ENTREGADO: 4,
+    }
+
+    @property
+    def pasos_seguimiento(self):
+        """
+        El semaforo del pedido: cuatro pasos, con cual esta hecho y cual es el
+        actual. Vacio mientras sea una reserva o si se cancelo, porque ahi no
+        hay avance que mostrar.
+        """
+        actual = self.SEGUIMIENTO.get(self.estado)
+        if actual is None:
+            return []
+
+        tercero = 'Listo para recoger' if self.es_recojo else 'Enviado'
+        nombres = ['Recibido', 'Confirmado', tercero, 'Entregado']
+        return [
+            {'nombre': nombre, 'hecho': numero < actual, 'actual': numero == actual}
+            for numero, nombre in enumerate(nombres, start=1)
+        ]
+
+    @property
+    def referencia(self):
+        """ Como se lo nombra en pantalla: su numero si ya lo tiene, si no su codigo """
+        return self.nro_pedido or self.codigo_reserva
+
+    def emitir_nro_pedido(self):
+        """
+        Le pone numero de venta al pedido, si todavia no lo tiene.
+
+        El correlativo es por dia y sin huecos. Se calcula sobre el mayor ya
+        emitido de esa fecha y no sobre la cantidad, para no chocar con los que
+        se emitieron cuando el numero salia del id.
+        """
+        if self.nro_pedido:
+            return self.nro_pedido
+
+        prefijo = f'P{timezone.localtime(self.fecha_registro):%Y%m%d}-'
+        for _ in range(5):
+            mayor = 0
+            emitidos = (
+                Pedido.objects
+                .filter(nro_pedido__startswith=prefijo)
+                .values_list('nro_pedido', flat=True)
+            )
+            for nro in emitidos:
+                try:
+                    mayor = max(mayor, int(nro[len(prefijo):]))
+                except (TypeError, ValueError):
+                    continue
+            try:
+                with transaction.atomic():
+                    self.nro_pedido = f'{prefijo}{mayor + 1:05d}'
+                    self.save(update_fields=['nro_pedido'])
+                return self.nro_pedido
+            except IntegrityError:
+                # otro pedido se llevo ese numero entre el calculo y el guardado
+                self.nro_pedido = None
+        raise IntegrityError('No se pudo emitir un numero de pedido para ' + self.codigo_reserva)
+
     def __str__(self):
-        return self.nro_pedido
+        return self.referencia
 
     @property
     def es_invitado(self):
@@ -133,6 +242,13 @@ class Pedido(models.Model):
         """ Si las unidades ya salieron del almacen o siguen solo reservadas """
         return self.estado in (self.PAGADO, self.ENVIADO, self.LISTO_RECOJO, self.ENTREGADO)
 
+    TERMINADOS = (EXPIRADO, CANCELADO)
+
+    @property
+    def cerrado_sin_venta(self):
+        """ Termino sin vender: se le acabo el tiempo o alguien lo cancelo """
+        return self.estado in self.TERMINADOS
+
     @property
     def reserva_vencida(self):
         return (
@@ -143,10 +259,18 @@ class Pedido(models.Model):
 
     @property
     def segundos_restantes(self):
-        """ Para la cuenta regresiva del checkout. None si no hay reloj corriendo. """
+        """
+        Para la cuenta regresiva del checkout. None si no hay reloj corriendo.
+
+        Redondea hacia arriba a proposito. Truncando, el navegador arrancaba
+        siempre por debajo del tiempo real y su cuenta llegaba a cero mientras
+        el servidor todavia daba la reserva por viva: recargaba, el servidor no
+        lo mandaba a ningun lado, y la pantalla quedaba quieta con el producto
+        retenido. Sobrar un segundo no le cuesta nada a nadie.
+        """
         if self.reserva_vence is None or self.descontado:
             return None
-        return max(int((self.reserva_vence - timezone.now()).total_seconds()), 0)
+        return max(ceil((self.reserva_vence - timezone.now()).total_seconds()), 0)
 
     @property
     def cancelable(self):
@@ -185,17 +309,30 @@ class Pedido(models.Model):
 
         if self.estado in (self.ENVIADO, self.LISTO_RECOJO, self.ENTREGADO):
             raise ValueError(
-                f'El pedido {self.nro_pedido} ya fue despachado: no admite comprobantes nuevos.'
+                f'El pedido {self.referencia} ya fue despachado: no admite comprobantes nuevos.'
             )
         if self.estado == self.PAGADO:
-            raise ValueError(f'El pedido {self.nro_pedido} ya esta pagado.')
+            raise ValueError(f'El pedido {self.referencia} ya esta pagado.')
 
-        # si la reserva se paso de plazo, se cierra antes de recibir el
-        # comprobante: el cliente igual puede declararlo, pero queda marcado
+        # un comprobante solo existe sobre un pedido vivo. Si el pedido murio
+        # -- se vencio o lo cerramos -- el cliente rehace la compra y sube el
+        # mismo voucher sobre el pedido nuevo. Aceptarlo aca creaba un pago que
+        # despues nadie podia procesar.
         if self.reserva_vencida:
-            self.cancelar('Vencio el plazo para pagar')
+            self.expirar()
+        if self.cerrado_sin_venta:
+            raise ValueError(
+                f'El pedido {self.referencia} esta '
+                f'{self.get_estado_display().lower()} y ya solto sus unidades. '
+                'No admite comprobantes: hay que rehacer la compra.'
+            )
 
         with transaction.atomic():
+            # el numero de venta nace con el comprobante, no con el checkout.
+            # Tambien para un pedido ya cancelado que paga tarde: mando su
+            # comprobante, entra a la serie.
+            self.emitir_nro_pedido()
+
             pago = Pago.objects.create(
                 pedido=self,
                 cuenta=cuenta,
@@ -203,15 +340,16 @@ class Pedido(models.Model):
                 nro_operacion=nro_operacion.strip(),
                 voucher=voucher,
                 fecha_pago=fecha_pago,
-                # transfirio despues de que se le solto la unidad. No se le
-                # cierra la puerta: se marca para que alguien lo mire.
-                fuera_de_plazo=(self.estado == self.CANCELADO),
             )
             if self.estado == self.SOLICITADO:
                 self.cambiar_estado(self.EN_VALIDACION)
-                # el reloj deja de correr contra el cliente: ya hizo su parte.
-                # Lo que queda es nuestro plazo para revisarlo.
-                self.reserva_vence = timezone.now() + timedelta(hours=settings.HORAS_VALIDACION)
+                # el reloj se apaga, no se reprograma. Con el comprobante arriba
+                # la unidad queda congelada hasta que una persona decida: que
+                # nosotros tardemos en validar no puede costarle el producto a
+                # quien ya transfirio. Lo que corre a partir de aca es la alarma
+                # interna de la bandeja (HORAS_ALERTA_VALIDACION), que nos avisa
+                # a nosotros y no le saca nada a nadie.
+                self.reserva_vence = None
                 self.save(update_fields=['reserva_vence'])
 
             # enterarse es lo que hace la diferencia entre validar en minutos y
@@ -240,49 +378,45 @@ class Pedido(models.Model):
             self.save(update_fields=['reserva_vence'])
         return self
 
-    def revivir_por_pago_tardio(self, usuario=None):
-        """
-        Unica salida de Cancelado, y a proposito solo por esta puerta: el cliente
-        transfirio despues de que se le solto la unidad, y todavia hay stock para
-        cumplirle. Si no lo hubiera, reservar falla y corresponde devolverle.
-        """
-        if self.estado != self.CANCELADO:
-            raise ValueError('Este pedido no esta cancelado')
-
-        with transaction.atomic():
-            detalles = list(self.detalles.order_by('id'))
-            items = {
-                item.id: item
-                for item in Inventario.objects
-                .select_for_update()
-                .filter(id__in={d.item_id for d in detalles})
-            }
-            for detalle in detalles:
-                items[detalle.item_id].reservar(detalle.cantidad)
-
-            self.estado = self.PAGADO
-            self.fecha_cancelacion = None
-            self.motivo_cancelacion = ''
-            self.save(update_fields=['estado', 'fecha_cancelacion', 'motivo_cancelacion'])
-
-            for detalle in detalles:
-                items[detalle.item_id].vender_reservado(
-                    detalle.cantidad, pedido=self, usuario=usuario
-                )
-            self.reserva_vence = None
-            self.save(update_fields=['reserva_vence'])
-        return self
-
     @classmethod
     def reservas_vencidas(cls, items=None):
         """ Los pedidos que se pasaron de plazo y todavia retienen unidades """
+        # solo SOLICITADO: un pedido en validacion ya tiene comprobante y su
+        # unidad no se suelta por tiempo, se suelta cuando alguien lo rechaza
         vencidos = cls.objects.filter(
-            estado__in=[cls.SOLICITADO, cls.EN_VALIDACION],
+            estado=cls.SOLICITADO,
             reserva_vence__lt=timezone.now(),
         )
         if items is not None:
             vencidos = vencidos.filter(detalles__item__in=items).distinct()
         return vencidos
+
+    @classmethod
+    def unidades_vencidas_por_item(cls, items):
+        """
+        Cuantas unidades de cada item retiene un pedido que ya se paso del plazo.
+
+        `Inventario.reservado` es un contador que solo baja cuando alguien cancela
+        el pedido. Hasta que eso pase, una reserva muerta sigue restando del
+        disponible. Esto dice cuanto de ese contador ya no vale, para descontarlo
+        al leer sin esperar a que nadie la venga a soltar.
+
+        Devuelve {item_id: unidades}, en una sola consulta.
+        """
+        items = [i for i in items if getattr(i, 'pk', i) is not None]
+        if not items:
+            return {}
+        filas = (
+            PedidoDetalle.objects
+            .filter(
+                item__in=items,
+                pedido__estado=cls.SOLICITADO,
+                pedido__reserva_vence__lt=timezone.now(),
+            )
+            .values('item_id')
+            .annotate(total=models.Sum('cantidad'))
+        )
+        return {fila['item_id']: fila['total'] for fila in filas}
 
     @classmethod
     def vencer_reservas(cls, items=None):
@@ -295,20 +429,45 @@ class Pedido(models.Model):
         """
         cuantos = 0
         for pedido in cls.reservas_vencidas(items):
-            pedido.cancelar('Vencio el plazo para pagar')
+            pedido.expirar()
             cuantos += 1
         return cuantos
+
+    def _por_que_no_puede(self, nuevo, etiquetas):
+        """
+        Explica por que no se puede mover, distinguiendo las dos razones.
+
+        Un pedido pagado con envio no puede pasar a "listo para recojo", pero no
+        porque este pagado: desde pagado avanza perfecto, solo que a "enviado".
+        Lo que no encaja es el modo de entrega. Decir "un pedido pagado no puede"
+        manda a mirar el estado, que es justo lo unico que esta bien.
+        """
+        destino = etiquetas.get(nuevo, nuevo).lower()
+
+        # si el destino si existiria con el otro modo de entrega, el obstaculo
+        # es el modo y no el estado
+        otro_ciclo = self.TRANSICIONES if self.es_recojo else self.TRANSICIONES_RECOJO
+        if nuevo in otro_ciclo.get(self.estado, ()):
+            modo = self.get_modo_entrega_display().lower()
+            siguientes = [
+                etiquetas[codigo]
+                for codigo in self.transiciones.get(self.estado, ())
+                if codigo != self.CANCELADO
+            ]
+            arreglo = f' Lo que sigue para el es {siguientes[0].lower()}.' if siguientes else ''
+            return f'Un pedido con {modo} no puede pasar a {destino}.{arreglo}'
+
+        return (
+            f'Un pedido {etiquetas[self.estado].lower()} no puede pasar a {destino}'
+        )
 
     def cambiar_estado(self, nuevo, usuario=None, motivo=''):
         """ Mueve el pedido por su ciclo. Cancelar pasa por `cancelar()`. """
         etiquetas = dict(self.ESTADO_CHOICES)
         if nuevo == self.estado:
-            raise ValueError(f'El pedido {self.nro_pedido} ya esta {etiquetas[self.estado].lower()}')
+            raise ValueError(f'El pedido {self.referencia} ya esta {etiquetas[self.estado].lower()}')
         if nuevo not in self.transiciones.get(self.estado, ()):
-            raise ValueError(
-                f'Un pedido {etiquetas[self.estado].lower()} no puede pasar a '
-                f'{etiquetas.get(nuevo, nuevo).lower()}'
-            )
+            raise ValueError(self._por_que_no_puede(nuevo, etiquetas))
         if nuevo == self.CANCELADO:
             return self.cancelar(motivo, usuario=usuario)
 
@@ -322,7 +481,7 @@ class Pedido(models.Model):
                 self.confirmar_venta(usuario=usuario)
         return self
 
-    def cancelar(self, motivo, usuario=None):
+    def cancelar(self, motivo, usuario=None, estado_final=None):
         """
         Devuelve al almacen todo lo que este pedido desconto y libera el uso del
         cupon.
@@ -330,8 +489,10 @@ class Pedido(models.Model):
         El pedido no se borra: queda cancelado, con su motivo y con sus lineas
         intactas, porque sigue siendo la fotografia de lo que se vendio ese dia.
         """
-        if self.estado == self.CANCELADO:
-            raise ValueError('Este pedido ya esta cancelado')
+        if self.estado in self.TERMINADOS:
+            raise ValueError(
+                f'Este pedido ya esta {dict(self.ESTADO_CHOICES)[self.estado].lower()}'
+            )
         if self.estado == self.ENTREGADO:
             raise ValueError(
                 'Un pedido entregado ya no se cancela: lo que corresponde es registrar '
@@ -383,7 +544,7 @@ class Pedido(models.Model):
                 self.cupon.veces_usado -= 1
                 self.cupon.save(update_fields=['veces_usado'])
 
-            self.estado = self.CANCELADO
+            self.estado = estado_final or self.CANCELADO
             self.fecha_cancelacion = timezone.now()
             self.motivo_cancelacion = motivo
             self.reserva_vence = None
@@ -392,6 +553,19 @@ class Pedido(models.Model):
             ])
 
         return self
+
+    def expirar(self, usuario=None):
+        """
+        Se le acabo el plazo sin comprobante: suelta las unidades y se cierra.
+
+        Hace lo mismo que cancelar -- devuelve el stock, libera el cupon,
+        conserva el detalle -- pero aterriza en EXPIRADO. La diferencia no es
+        cosmetica: un expirado es un cliente que no llego, y eso se cuenta
+        aparte de los que cancelamos nosotros.
+        """
+        return self.cancelar(
+            'Vencio el plazo para pagar', usuario=usuario, estado_final=self.EXPIRADO
+        )
 
 
 class PedidoDetalle(models.Model):

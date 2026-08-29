@@ -37,7 +37,7 @@ si no, la diferencia queda escrita con nombre y fecha.
                 {% for detalle in viaje.detalles.all %}
                 <tr>
                     <td>{{ detalle.item }}</td>
-                    <td>{{ detalle.get_motivo_display }}{% if detalle.pedido %} &middot; {{ detalle.pedido.nro_pedido }}{% endif %}</td>
+                    <td>{{ detalle.get_motivo_display }}{% if detalle.pedido %} &middot; {{ detalle.pedido.referencia }}{% endif %}</td>
                     <td class="rt-num">{{ detalle.cantidad }}</td>
                     <td>
                         <input type="number" name="llegaron-{{ detalle.id }}"

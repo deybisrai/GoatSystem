@@ -29,11 +29,11 @@ def avisar_pago_declarado(pago, base_url=''):
     pedido = pago.pedido
     enlace = f'{base_url}{reverse("web:validarPago", args=[pago.id])}'
 
-    asunto = f'Pago por validar: {pedido.nro_pedido} - s/{pago.monto_declarado}'
+    asunto = f'Pago por validar: {pedido.referencia} - s/{pago.monto_declarado}'
     cuerpo = '\n'.join([
         f'{pedido.nombre_comprador} {pedido.apellido_comprador} declara haber pagado.',
         '',
-        f'Pedido    : {pedido.nro_pedido}',
+        f'Pedido    : {pedido.referencia}',
         f'Total     : s/{pedido.monto_total}',
         f'Declara   : s/{pago.monto_declarado}',
         f'Cuenta    : {pago.cuenta}',

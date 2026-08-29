@@ -25,7 +25,7 @@ cuenta: validar es contar, no aceptar.
     {% for pago in pagos %}
     <div class="vp-pago">
         <div class="vp-datos">
-            <h2>{{ pago.pedido.nro_pedido }}</h2>
+            <h2>{{ pago.pedido.referencia }}</h2>
             <table>
                 <tr><th>Cliente</th><td>{{ pago.pedido.nombre_comprador }} {{ pago.pedido.apellido_comprador }}</td></tr>
                 <tr><th>Total del pedido</th><td><b>s/{{ pago.pedido.monto_total }}</b></td></tr>

@@ -155,16 +155,65 @@ class Inventario(models.Model):
         descuento = base * campana.porcentaje_descuento / Decimal('100')
         return (base - descuento).quantize(Decimal('0.01'))
 
+    def refresh_from_db(self, *args, **kwargs):
+        """
+        Recargar la fila tiene que tirar tambien lo precargado.
+
+        `_reservado_vencido` no es una columna, asi que Django no lo toca: sin
+        esto, un `refresh_from_db()` despues de soltar la reserva devolvia el
+        stock sumado dos veces.
+        """
+        self._reservado_vencido = None
+        return super().refresh_from_db(*args, **kwargs)
+
+    @property
+    def reservado_vencido(self):
+        """
+        La parte de `reservado` que retienen pedidos con el plazo ya cumplido.
+
+        Una reserva deja de valer por el paso del tiempo, no porque alguien la
+        venga a soltar. Sin esto, la ultima unidad quedaba trabada para siempre:
+        el catalogo la mostraba agotada, el carrito no dejaba agregarla, y la
+        unica rutina que la liberaba vivia detras del checkout, al que ya no se
+        podia llegar. El plazo se cumple solo; el papeleo puede esperar.
+        """
+        if self.pk is None:
+            return 0
+        cacheado = getattr(self, '_reservado_vencido', None)
+        if cacheado is None:
+            from .ventas import Pedido
+            cacheado = Pedido.unidades_vencidas_por_item([self]).get(self.pk, 0)
+            self._reservado_vencido = cacheado
+        return cacheado
+
+    @classmethod
+    def precargar_vencidas(cls, items):
+        """
+        Resuelve `reservado_vencido` de varios items en una sola consulta.
+
+        Sin esto, mirar las ocho tallas de un producto son ocho consultas. Es la
+        misma idea que `select_related`, pero para un dato que no vive en una
+        relacion. Devuelve la lista, para poder encadenarlo.
+        """
+        from .ventas import Pedido
+        items = list(items)
+        mapa = Pedido.unidades_vencidas_por_item(items)
+        for item in items:
+            item._reservado_vencido = mapa.get(item.pk, 0)
+        return items
+
     @property
     def disponible(self):
         """
-        Lo que se puede vender ahora: lo que hay menos lo comprometido.
+        Lo que se puede vender ahora: lo que hay menos lo comprometido que sigue
+        vigente. Una reserva vencida no cuenta, aunque su pedido todavia no se
+        haya cancelado: los 15 minutos se cumplen con el reloj, no con el tramite.
 
         Devuelve un numero, no un booleano. Como 0 es falso, las plantillas que
         preguntan `{% if item.disponible %}` siguen funcionando igual, y las que
         quieran mostrar cuantas quedan ya tienen el dato.
         """
-        return max(self.stock - self.reservado, 0)
+        return max(self.stock - self.reservado + self.reservado_vencido, 0)
 
     def reservar(self, cantidad):
         """
@@ -179,7 +228,9 @@ class Inventario(models.Model):
 
         with transaction.atomic():
             actual = Inventario.objects.select_for_update().get(pk=self.pk)
-            libres = max(actual.stock - actual.reservado, 0)
+            # la misma cuenta que ve el cliente en el catalogo: si ahi dice que
+            # hay una, aca no puede decir que no
+            libres = actual.disponible
             if cantidad > libres:
                 raise ValueError(f'Solo quedan {libres} unidades de {self}')
 

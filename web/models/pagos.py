@@ -179,7 +179,6 @@ class Pago(models.Model):
     # transfirio despues de que se le solto la unidad. Se acepta igual, para que
     # el cliente no quede con la plata movida y sin forma de avisar, pero llega
     # marcado: puede que ya no haya stock y corresponda devolverle.
-    fuera_de_plazo = models.BooleanField(default=False)
 
     estado = models.CharField(max_length=1, default=PENDIENTE, choices=ESTADO_CHOICES)
     monto_confirmado = models.DecimalField(
@@ -204,7 +203,7 @@ class Pago(models.Model):
         ]
 
     def __str__(self):
-        return f'{self.nro_operacion} - {self.pedido.nro_pedido}'
+        return f'{self.nro_operacion} - {self.pedido.referencia}'
 
     @property
     def horas_esperando(self):
@@ -272,16 +271,19 @@ class Pago(models.Model):
             ])
 
             pedido = self.pedido
-            if pedido.estado == Pedido.CANCELADO:
-                # pago tardio: se le solto la unidad y ahora la reclama
-                try:
-                    pedido.revivir_por_pago_tardio(usuario=usuario)
-                except ValueError as falta:
-                    raise ValueError(
-                        f'{falta}. El cliente pago fuera de plazo y esas unidades ya se '
-                        'fueron con otro pedido: corresponde devolverle el dinero.'
-                    )
-            elif pedido.estado != Pedido.PAGADO:
+            if pedido.cerrado_sin_venta:
+                # el pedido ya termino y solto sus unidades. Darlo por pagado
+                # desde aca lo resucitaria a espaldas del almacen; y decidir si
+                # corresponde cumplirle o devolverle no es algo que el sistema
+                # pueda resolver mirando una captura. Lo resuelve una persona.
+                raise ValueError(
+                    f'El pedido {pedido.referencia} esta '
+                    f'{pedido.get_estado_display().lower()} y ya solto sus unidades. '
+                    'Coordinalo con el cliente por WhatsApp: si el pago fue real, '
+                    'que rehaga la compra y suba este mismo comprobante. Mientras '
+                    'tanto, rechaza este pago con el motivo para sacarlo de la bandeja.'
+                )
+            if pedido.estado != Pedido.PAGADO:
                 # pasar a Pagado convierte la reserva en venta: recien ahi las
                 # unidades salen del almacen y aparecen en el kardex
                 pedido.cambiar_estado(Pedido.PAGADO, usuario=usuario)
@@ -289,19 +291,36 @@ class Pago(models.Model):
 
     def rechazar(self, motivo, usuario=None):
         """
-        Descarta el comprobante. El pedido NO retrocede: sigue en validacion y el
-        cliente puede subir otro, viendo el motivo. Asi los estados solo avanzan,
-        como en el resto del proyecto.
+        Descarta el comprobante y cierra el pedido, soltando las unidades.
+
+        Un comprobante rechazado es un pedido sin pago detras, y un pedido sin
+        pago no puede retener inventario: mientras espera, ese par no se le
+        ofrece a nadie mas. Con la validacion sin vencimiento, dejarlo abierto
+        lo congelaba para siempre.
+
+        Al cliente no se le cierra la puerta. El pedido queda cancelado con el
+        motivo a la vista, y si de verdad pago puede subir un comprobante
+        corregido: al validarlo el pedido revive, si todavia hay unidad. Si otra
+        persona ya se la llevo, lo atiende un asesor por WhatsApp.
         """
+        from .ventas import Pedido
+
         if self.estado == self.VALIDADO:
             raise ValueError('Este pago ya fue validado: no se puede rechazar despues')
         motivo = (motivo or '').strip()
         if not motivo:
             raise ValueError('Rechazar un pago exige un motivo: el cliente lo va a leer')
 
-        self.estado = self.RECHAZADO
-        self.motivo_rechazo = motivo
-        self.validado_por = usuario
-        self.fecha_validacion = timezone.now()
-        self.save(update_fields=['estado', 'motivo_rechazo', 'validado_por', 'fecha_validacion'])
+        with transaction.atomic():
+            self.estado = self.RECHAZADO
+            self.motivo_rechazo = motivo
+            self.validado_por = usuario
+            self.fecha_validacion = timezone.now()
+            self.save(update_fields=[
+                'estado', 'motivo_rechazo', 'validado_por', 'fecha_validacion',
+            ])
+
+            pedido = self.pedido
+            if not pedido.cerrado_sin_venta:
+                pedido.cancelar(f'Comprobante rechazado: {motivo}', usuario=usuario)
         return self

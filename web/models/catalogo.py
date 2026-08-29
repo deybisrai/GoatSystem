@@ -124,11 +124,6 @@ class Categoria(models.Model):
         'Usa genero', default=False,
         help_text='Marcar solo en moda (calzado, ropa). En tecnologia o electrodomesticos no aplica.'
     )
-    trasladable = models.BooleanField(
-        default=True,
-        help_text='Si los productos de esta categoria pueden viajar entre ciudades. '
-                  'Una refrigeradora cuesta mas trasladarla que lo que deja la venta.',
-    )
     activo = models.BooleanField(default=True)
     fecha_registro = models.DateTimeField(auto_now_add=True)
 
@@ -187,10 +182,16 @@ class Producto(models.Model):
         max_length=1, choices=GENERO_CHOICES, blank=True,
         help_text='Solo para moda. Dejar vacio en electrodomesticos, tecnologia, etc.'
     )
-    trasladable = models.BooleanField(
-        null=True, blank=True,
-        help_text='Vacio = como su categoria. Solo para la excepcion puntual: '
-                  'un microondas chico que si viaja, un producto fragil que no.',
+    # Se marca la excepcion, no la regla. Casi todo viaja: una zapatilla, un
+    # celular, una licuadora. Lo que no viaja es raro -- una refrigeradora, algo
+    # fragil -- y es lo unico que hay que acordarse de marcar. Antes esto eran
+    # dos campos y tres estados (si / no / heredar de la categoria) para
+    # describir una excepcion que casi nunca ocurre.
+    no_se_traslada = models.BooleanField(
+        default=False,
+        verbose_name='No se traslada a otras ciudades',
+        help_text='Marcar solo si el producto no puede viajar: una refrigeradora '
+                  'cuesta mas trasladarla que lo que deja la venta. Sin marcar, viaja.',
     )
     activo = models.BooleanField(default=True)
     creado = models.DateTimeField(auto_now_add=True)
@@ -222,9 +223,7 @@ class Producto(models.Model):
     @property
     def se_traslada(self):
         """ Si puede ofrecerse en una ciudad donde no esta fisicamente """
-        if self.trasladable is None:
-            return self.categoria.trasladable
-        return self.trasladable
+        return not self.no_se_traslada
 
     def curvas_disponibles(self):
         return Curva.aplicables(self.categoria, self.genero)

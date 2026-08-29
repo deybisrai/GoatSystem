@@ -86,7 +86,7 @@ class MovimientoInventario(models.Model):
         if self.compra_id:
             return str(self.compra)
         if self.pedido_id:
-            return f'Pedido {self.pedido.nro_pedido}'
+            return f'Pedido {self.pedido.referencia}'
         if self.traslado_id:
             return str(self.traslado)
         return ''

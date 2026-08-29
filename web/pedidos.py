@@ -7,10 +7,9 @@ exactamente esta misma logica de descuento de stock.
 
 from datetime import timedelta
 from decimal import Decimal
-from uuid import uuid4
 
 from django.conf import settings
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from .models import Cliente, Cupon, Pedido, PedidoDetalle, Inventario
@@ -25,6 +24,32 @@ def _sufijo(linea):
     if not linea.get('valor'):
         return ''
     return f", {linea.get('atributo', '').lower()} {linea['valor']}".rstrip()
+
+
+def _crear_cabecera(token, **campos):
+    """
+    Crea la cabecera del pedido. Devuelve (pedido, lo_cree_yo).
+
+    Dos envios simultaneos llegan los dos hasta aca. El unique de
+    `token_checkout` deja pasar uno solo; el que pierde recibe el pedido del
+    ganador con `lo_cree_yo=False`, y eso es una orden de abandonar. Si en vez
+    de abandonar sigue adelante, le agrega sus lineas y sus reservas al pedido
+    ajeno: un solo pedido, con el doble de todo. Paso de verdad probandolo.
+
+    La relectura va con `select_for_update()` a proposito: una lectura comun
+    usaria la foto que esta transaccion tomo al empezar, y en esa foto el
+    pedido del ganador todavia no existe.
+    """
+    try:
+        with transaction.atomic():
+            return Pedido.objects.create(token_checkout=token, **campos), True
+    except IntegrityError:
+        if token is None:
+            raise
+        ganador = Pedido.objects.select_for_update().filter(token_checkout=token).first()
+        if ganador is None:
+            raise                    # el choque fue por otra cosa
+        return ganador, False
 
 
 @transaction.atomic
@@ -44,6 +69,15 @@ def crear_pedido(carrito, datos, usuario=None):
     if not lineas:
         raise PedidoError('Tu carrito esta vacio')
 
+    # el mismo envio del formulario no crea un pedido nuevo. Este atajo resuelve
+    # el caso comun (clic, refresh, boton atras); la carrera de verdad -- dos
+    # envios a la vez que pasan los dos por aca -- la corta el unique de abajo.
+    token = (datos.get('token_checkout') or '').strip() or None
+    if token:
+        ya_creado = Pedido.objects.filter(token_checkout=token).first()
+        if ya_creado is not None:
+            return ya_creado
+
     ids = [linea['item_id'] for linea in lineas]
 
     # antes de mirar si hay stock se sueltan las reservas que se pasaron de plazo.
@@ -60,6 +94,7 @@ def crear_pedido(carrito, datos, usuario=None):
             .filter(id__in=ids)
         )
     }
+    Inventario.precargar_vencidas(inventario.values())
 
     cliente = None
     if usuario is not None and usuario.is_authenticated:
@@ -67,9 +102,11 @@ def crear_pedido(carrito, datos, usuario=None):
 
     punto = datos.get('punto_recojo') if datos.get('modo_entrega') == Pedido.RECOJO else None
 
-    pedido = Pedido.objects.create(
+    pedido, lo_cree_yo = _crear_cabecera(
+        token=token,
         cliente=cliente,
-        nro_pedido=uuid4().hex[:20],          # provisional, se reemplaza abajo
+        # sin numero de pedido: se emite recien cuando llega el comprobante.
+        # Hasta entonces el pedido se identifica por su codigo_reserva.
         nombre_comprador=datos['nombre'],
         apellido_comprador=datos['apellidos'],
         email_comprador=datos['email'],
@@ -89,6 +126,11 @@ def crear_pedido(carrito, datos, usuario=None):
         punto_recojo_direccion=punto.direccion_completa if punto else '',
         reserva_vence=timezone.now() + timedelta(minutes=settings.MINUTOS_RESERVA),
     )
+
+    if not lo_cree_yo:
+        # perdimos la carrera. El pedido ya existe completo, con sus lineas y
+        # sus reservas puestas por el envio que gano: seguir seria duplicarselas
+        return pedido
 
     monto_total = Decimal('0')
 
@@ -158,7 +200,6 @@ def crear_pedido(carrito, datos, usuario=None):
         pedido.descuento_aplicado = descuento
 
     pedido.monto_total = monto_total - descuento
-    pedido.nro_pedido = f'P{pedido.fecha_registro:%Y%m%d}-{pedido.id:05d}'
-    pedido.save(update_fields=['monto_total', 'nro_pedido', 'cupon', 'descuento_aplicado'])
+    pedido.save(update_fields=['monto_total', 'cupon', 'descuento_aplicado'])
 
     return pedido

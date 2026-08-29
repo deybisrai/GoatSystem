@@ -99,10 +99,15 @@ class Cart:
                 )
             raise ValueError(f'Solo quedan {self._unidades(disponible)} mas de {nombre}')
 
+        self.cart[clave] = self._linea(item, nueva_cantidad)
+        self.save()
+
+    @staticmethod
+    def _linea(item, cantidad):
+        """ La fotografia de una linea del carrito, sin mirar disponibilidad """
         variante = item.variante
         precio = item.precio_final()
-
-        self.cart[clave] = {
+        return {
             'item_id': item.id,
             'sku': variante.sku,
             'nombre': variante.producto.nombre,
@@ -112,10 +117,64 @@ class Cart:
             'valor': item.valor.valor if item.valor_id else '',
             'imagen': variante.imagen.url if variante.imagen else '',
             'precio': str(precio),
-            'cantidad': nueva_cantidad,
-            'subtotal': str(precio * nueva_cantidad),
+            'cantidad': cantidad,
+            'subtotal': str(precio * cantidad),
         }
+
+    def restaurar(self, pares):
+        """
+        Devuelve al carrito lo que tenia un pedido, cueste lo que cueste.
+
+        A diferencia de `add`, no comprueba disponibilidad: si mientras el
+        cliente no pagaba otro se llevo la unidad, la linea igual tiene que
+        volver. Verla en el carrito con el aviso de que se agoto es mucho mas
+        claro que encontrarse el carrito vacio sin explicacion.
+
+        `pares` son tuplas (Inventario, cantidad).
+        """
+        for item, cantidad in pares:
+            if cantidad <= 0:
+                continue
+            clave = str(item.id)
+            anterior = self.cart.get(clave, {}).get('cantidad', 0)
+            self.cart[clave] = self._linea(item, anterior + cantidad)
         self.save()
+
+    def problemas(self):
+        """
+        Que lineas ya no se pueden comprar, y por que. {item_id: motivo}
+
+        El carrito vive en la sesion y no sabe nada del almacen: una linea puede
+        pasar horas ahi mientras otro cliente se lleva la ultima unidad. Esto lo
+        dice en el carrito, y no en el checkout, que es donde el golpe llega
+        tarde y con el formulario ya lleno.
+        """
+        from .models import Inventario
+
+        if not self.cart:
+            return {}
+
+        ids = [linea['item_id'] for linea in self]
+        items = {
+            item.id: item
+            for item in Inventario.precargar_vencidas(
+                Inventario.objects
+                .filter(id__in=ids)
+                .select_related('variante__producto')
+            )
+        }
+
+        fallas = {}
+        for linea in self:
+            item = items.get(linea['item_id'])
+            if item is None or not item.variante.activo or not item.variante.producto.activo:
+                fallas[linea['item_id']] = 'ya no esta a la venta'
+            elif item.disponible == 0:
+                fallas[linea['item_id']] = 'se agoto'
+            elif linea['cantidad'] > item.disponible:
+                unidades = 'unidad' if item.disponible == 1 else 'unidades'
+                fallas[linea['item_id']] = f'solo quedan {item.disponible} {unidades}'
+        return fallas
 
     def actualizar(self, item, cantidad):
         """ Fija una cantidad exacta. Si es 0 o menos, quita la linea. """

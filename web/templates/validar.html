@@ -44,12 +44,9 @@
                         {% endif %}
                     </span>
                     <span class="vp-datos">
-                        <b class="vp-pedido">{{ pago.pedido.nro_pedido }}</b>
+                        <b class="vp-pedido">{{ pago.pedido.referencia }}</b>
                         <span class="vp-cliente">{{ pago.pedido.nombre_comprador }} {{ pago.pedido.apellido_comprador }}</span>
                         <span class="vp-meta">{{ pago.cuenta.etiqueta }} &middot; op. {{ pago.nro_operacion }}</span>
-                        {% if pago.fuera_de_plazo %}
-                        <span class="vp-tarde">Pago fuera de plazo</span>
-                        {% endif %}
                     </span>
                     <span class="vp-derecha">
                         <b class="vp-monto">s/{{ pago.monto_declarado }}</b>

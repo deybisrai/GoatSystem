@@ -4,14 +4,26 @@
     <p class="gracias-check">&#10003;</p>
     <h1>Gracias por tu compra</h1>
     <p class="gracias-sub">
-        Registramos tu pedido <b>{{ pedido.nro_pedido }}</b>.
+        Registramos tu pedido <b>{{ pedido.referencia }}</b>.
         Te escribiremos a <b>{{ pedido.email_comprador }}</b> para coordinar la entrega.
     </p>
+
+    {% if pedido.pasos_seguimiento %}
+    <ol class="seg" aria-label="Estado de tu pedido">
+        {% for paso in pedido.pasos_seguimiento %}
+        <li class="seg-paso{% if paso.hecho %} seg-hecho{% endif %}{% if paso.actual %} seg-actual{% endif %}">
+            <span class="seg-punto" aria-hidden="true"></span>
+            <span class="seg-nombre">{{ paso.nombre }}</span>
+            {% if paso.actual %}<span class="seg-aca">Estas aca</span>{% endif %}
+        </li>
+        {% endfor %}
+    </ol>
+    {% endif %}
 
     {% if pedido.pago_pendiente %}
     <p class="gracias-estado">
         Estamos verificando tu comprobante contra nuestra cuenta.
-        Apenas quede confirmado preparamos tu envio.
+        Apenas quede confirmado preparamos tu pedido.
     </p>
     {% elif pedido.estado == '0' %}
     <p class="gracias-estado gracias-pendiente">
@@ -69,6 +81,13 @@
         {% endif %}
     </div>
 
+    {% if whatsapp %}
+    <p class="gracias-wsp">
+        Algo no cuadra?
+        <a href="{{ whatsapp }}" target="_blank" rel="noopener">Escribinos por WhatsApp</a>
+    </p>
+    {% endif %}
+
     <a href="{% url 'web:index' %}" class="button">Seguir comprando</a>
 </div>
 
@@ -92,6 +111,82 @@
         line-height: 1;
     }
     .gracias h1 { margin: 0 0 10px; }
+
+    /* semaforo del pedido: la linea se pinta hasta donde llego */
+    .seg {
+        list-style: none;
+        display: grid;
+        grid-auto-flow: column;
+        grid-auto-columns: 1fr;
+        gap: 0;
+        margin: 28px 0 30px;
+        padding: 0;
+        counter-reset: seg;
+    }
+    .seg-paso {
+        position: relative;
+        padding-top: 26px;
+        text-align: center;
+        font-size: 12.5px;
+        line-height: 1.35;
+        color: #9a9a9a;
+    }
+    /* la barra entre puntos: mitad izquierda de cada paso */
+    .seg-paso::before,
+    .seg-paso::after {
+        content: "";
+        position: absolute;
+        top: 7px;
+        height: 2px;
+        background: #dcdcdc;
+    }
+    .seg-paso::before { left: 0; right: 50%; }
+    .seg-paso::after { left: 50%; right: 0; }
+    .seg-paso:first-child::before,
+    .seg-paso:last-child::after { display: none; }
+
+    .seg-punto {
+        position: absolute;
+        top: 0;
+        left: 50%;
+        transform: translateX(-50%);
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        border: 2px solid #dcdcdc;
+        background: #fff;
+        z-index: 1;
+    }
+    .seg-nombre { display: block; }
+    .seg-aca {
+        display: block;
+        margin-top: 3px;
+        font-size: 11px;
+        letter-spacing: .04em;
+        text-transform: uppercase;
+        color: #3e7a4c;
+    }
+
+    /* pasos ya cumplidos */
+    .seg-hecho { color: #4a4a4a; }
+    .seg-hecho .seg-punto { border-color: #3e7a4c; background: #3e7a4c; }
+    .seg-hecho::before, .seg-hecho::after { background: #3e7a4c; }
+    /* el paso actual pinta su mitad izquierda, no la derecha */
+    .seg-actual { color: #245132; font-weight: 600; }
+    .seg-actual .seg-punto {
+        border-color: #3e7a4c;
+        background: #fff;
+        box-shadow: 0 0 0 4px rgba(62, 122, 76, .16);
+    }
+    .seg-actual::before { background: #3e7a4c; }
+
+    .gracias-wsp { margin: 0 0 18px; font-size: 14px; color: #6a6a6a; }
+    .gracias-wsp a { color: #245132; font-weight: 600; }
+
+    @media (max-width: 520px) {
+        .seg { font-size: 11.5px; }
+        .seg-aca { display: none; }
+    }
     .gracias-sub { color: #6a6a6a; margin: 0 0 18px; }
     .gracias-estado {
         background: #fff;

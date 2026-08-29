@@ -51,6 +51,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'web.middleware.VencerReservasMiddleware',
 ]
 
 ROOT_URLCONF = 'goatsystem.urls'
@@ -112,7 +113,7 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'UTC'
+TIME_ZONE = 'America/Lima'
 
 USE_I18N = True
 
@@ -140,25 +141,33 @@ MEDIA_URL = '/media/'
 PRIVADO_ROOT = os.path.join(BASE_DIR, 'privado')
 
 # Cuanto le guardamos el producto al cliente mientras va a pagar.
-# Corto de mas es peor que largo de mas: si vence a mitad de la transferencia,
-# el cliente ya movio plata y hay que devolversela. Contar lo que tiene que
-# hacer -- abrir Yape, escanear, confirmar, sacar captura, volver y subirla --
-# son 4 o 5 minutos para alguien agil, y 10 con transferencia bancaria.
-MINUTOS_RESERVA = 15
+#
+# Es plazo del cliente: todavia no pago. Si no cumple, se suelta la unidad y no
+# le costo nada. El que ya transfirio y se paso del plazo no queda afuera: sube
+# su comprobante igual, cuando sea, y se resuelve mirandolo.
+MINUTOS_RESERVA = 10
 
 # Lo que le prometemos al cliente: en cuanto confirmamos su pago.
 #
-# Este plazo NO es simetrico con el de arriba, y es a proposito. Los 15 minutos
-# son plazo del cliente: todavia no pago, y si no cumple soltamos la unidad sin
-# que le cueste nada. Estas horas son plazo NUESTRO: el cliente ya transfirio,
-# ya hizo su parte, y soltarle la unidad seria castigarlo por nuestra demora.
-# Por eso el de despues es mas largo: no es una fecha limite para el, es una red
-# por si nos trabamos.
+# Es plazo NUESTRO y por eso NO le quita la unidad a nadie. El cliente ya
+# transfirio, ya hizo su parte; soltarle el producto porque nosotros tardamos
+# seria castigarlo por nuestra demora. Con el comprobante arriba, la unidad
+# queda congelada hasta que una persona decida, tarde lo que tarde.
+# Este numero es la promesa que mostramos y avisamos, no un vencimiento.
 HORAS_VALIDACION = 12
+
+# Cada cuanto el trafico normal paga el costo de barrer las reservas vencidas.
+# No es el plazo de nada: es cada cuanto se revisa si algun plazo se cumplio.
+# En 0 se apaga el barrido automatico y queda solo el comando.
+SEGUNDOS_ENTRE_BARRIDOS = 60
 
 # Y a las cuantas horas la bandeja lo marca como demorado. Es la alarma interna,
 # la mitad del plazo prometido, para llegar a tiempo y no enterarse tarde.
 HORAS_ALERTA_VALIDACION = 6
+
+# El asesor que atiende por WhatsApp: devoluciones, dudas y todo lo que no
+# resuelve una pantalla. Formato internacional, sin + ni espacios.
+WHATSAPP_ASESOR = '51955134139'
 
 # A quien se le avisa cuando llega un comprobante. En desarrollo el correo sale
 # por consola; el SMTP real se configura en la fase 8, que igual hace falta para
