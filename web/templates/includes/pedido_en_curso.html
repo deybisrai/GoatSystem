@@ -1,0 +1,155 @@
+{% if pedido_en_curso %}
+{% comment %}
+    El camino de vuelta a la pantalla de pago.
+
+    Se encuentra por la sesion, igual que /pago, asi que cubre al cliente que se
+    fue a mirar otro producto o cerro el navegador -- la sesion dura 14 dias y
+    sobrevive al cierre. No cubre el cambio de dispositivo: para eso hara falta
+    un buscador de pedidos, que es otra conversacion.
+
+    Ojo: {# #} es de UNA linea. Con varias, Django imprime el resto como texto.
+{% endcomment %}
+<div class="pec" id="pec" data-segundos="{{ segundos_en_curso }}" role="status">
+    <span class="pec-punto" aria-hidden="true"></span>
+
+    <span class="pec-texto">
+        <b>Tenes un pedido esperando pago.</b>
+        <span class="pec-detalle">
+            {{ pedido_en_curso.referencia }} &middot; s/{{ pedido_en_curso.monto_total }}
+        </span>
+    </span>
+
+    <span class="pec-reloj" id="pec-reloj" hidden>
+        <span class="pec-reloj-rot">te lo guardamos</span>
+        <b id="pec-cifra">--:--</b>
+    </span>
+
+    <a class="pec-boton" href="{% url 'web:pagoPedido' %}">Completar mi pago</a>
+</div>
+
+<style>
+    .pec {
+        position: fixed;
+        left: 50%;
+        bottom: 18px;
+        transform: translateX(-50%);
+        z-index: 9000;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        max-width: calc(100vw - 28px);
+        padding: 11px 16px;
+        border: 1px solid #d7ded7;
+        border-left: 3px solid #b5541b;
+        border-radius: 6px;
+        background: #fff;
+        box-shadow: 0 6px 26px rgba(0, 0, 0, .17);
+        font-size: 14px;
+        line-height: 1.35;
+        animation: pec-aparece .3s ease;
+    }
+    /* Solo opacidad. El transform es lo que POSICIONA el banner -- centrarlo en
+       escritorio -- y animarlo lo dejaba desplazado 14px cuando se cruzaban el
+       media query de movil y el de prefers-reduced-motion. Una animacion no
+       tiene por que pelearse con el posicionamiento. */
+    @keyframes pec-aparece {
+        from { opacity: 0; }
+        to   { opacity: 1; }
+    }
+    @media (prefers-reduced-motion: reduce) { .pec { animation: none; } }
+
+    .pec-punto {
+        flex: 0 0 auto;
+        width: 9px; height: 9px;
+        border-radius: 50%;
+        background: #b5541b;
+    }
+    .pec-texto { flex: 1 1 auto; min-width: 0; }
+    .pec-texto b { display: block; color: #7d3a13; }
+    .pec-detalle { color: #6a6a6a; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+
+    .pec-reloj {
+        flex: 0 0 auto;
+        text-align: right;
+        line-height: 1.2;
+    }
+    .pec-reloj-rot { display: block; font-size: 11px; color: #8c8c8c; }
+    .pec-reloj b {
+        font-size: 17px;
+        color: #7d3a13;
+        font-variant-numeric: tabular-nums;
+    }
+    /* los ultimos dos minutos se ven distinto */
+    .pec-reloj b.pec-apura { color: #b5541b; }
+
+    .pec-boton {
+        flex: 0 0 auto;
+        padding: 8px 15px;
+        border-radius: 4px;
+        background: #3e7a4c;
+        color: #fff;
+        text-decoration: none;
+        font-size: 13.5px;
+        font-weight: 600;
+        white-space: nowrap;
+    }
+    .pec-boton:hover, .pec-boton:focus-visible { background: #34663f; color: #fff; }
+
+    /* vencido: ya no hay nada que apurar, pero si algo que explicar */
+    .pec-fuera { border-left-color: #8c8c8c; }
+    .pec-fuera .pec-punto { background: #8c8c8c; }
+    .pec-fuera .pec-texto b { color: #4a4a4a; }
+
+    @media (max-width: 560px) {
+        .pec {
+            left: 10px; right: 10px; bottom: 10px;
+            transform: none;
+            max-width: none;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .pec-texto { flex: 1 1 100%; }
+        .pec-boton {
+            flex: 1 1 auto;
+            text-align: center;
+            /* 44px es el minimo comodo para tocar con el pulgar */
+            padding: 12px 15px;
+        }
+    }
+</style>
+
+<script>
+(function () {
+    var caja = document.getElementById('pec');
+    if (!caja) return;
+
+    var quedan = parseInt(caja.dataset.segundos, 10);
+    if (isNaN(quedan)) return;
+
+    var reloj = document.getElementById('pec-reloj');
+    var cifra = document.getElementById('pec-cifra');
+    var boton = caja.querySelector('.pec-boton');
+    var texto = caja.querySelector('.pec-texto b');
+
+    function vencido() {
+        caja.classList.add('pec-fuera');
+        reloj.hidden = true;
+        texto.textContent = 'Se vencio el plazo de tu pedido.';
+        boton.textContent = 'Ver que paso';
+    }
+
+    if (quedan <= 0) { vencido(); return; }
+
+    reloj.hidden = false;
+    var pintar = function () {
+        if (quedan <= 0) { vencido(); return; }
+        var m = Math.floor(quedan / 60), s = quedan % 60;
+        cifra.textContent = m + ':' + (s < 10 ? '0' : '') + s;
+        cifra.classList.toggle('pec-apura', quedan <= 120);
+        quedan -= 1;
+    };
+    pintar();
+    setInterval(pintar, 1000);
+})();
+</script>
+{% endif %}

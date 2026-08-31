@@ -4600,3 +4600,126 @@ class CorreosAlClienteTests(_AlmacenMixin, _VentaMixin, TestCase):
         with self.captureOnCommitCallbacks(execute=False):
             pedido.cambiar_estado(Pedido.PAGADO)
         self.assertEqual(self._al_cliente(pedido), [])
+
+
+class AvisoPedidoEnCursoTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """
+    El camino de vuelta a la pantalla de pago.
+
+    /pago se encuentra por la sesion y no hay ninguna URL que lleve a ella. Quien
+    se iba a mirar otro producto perdia el rastro, se le vencia la reserva en
+    diez minutos y nunca supo por que. Era el unico agujero que costaba una venta
+    de alguien que ya habia decidido comprar.
+    """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B230-1', [(self.t40, 4, Decimal('300.00'))], aplicar=True)
+        self.cuenta = _cuenta_bcp()
+        cache.clear()
+
+    def _con_pedido(self):
+        self._agregar(self.t40, 1)
+        return self._comprar()
+
+    def _mirar(self, url=None):
+        return self.client.get(url or reverse('web:index'))
+
+    # --- cuando debe aparecer ---
+
+    def test_aparece_en_cualquier_pantalla(self):
+        pedido = self._con_pedido()
+
+        for url in (reverse('web:index'),
+                    reverse('web:carrito'),
+                    reverse('web:producto', args=[self.variante.sku])):
+            respuesta = self.client.get(url)
+            self.assertContains(respuesta, 'Tenes un pedido esperando pago', msg_prefix=url)
+            self.assertContains(respuesta, pedido.referencia, msg_prefix=url)
+
+    def test_trae_el_enlace_de_vuelta_y_el_monto(self):
+        pedido = self._con_pedido()
+
+        respuesta = self._mirar()
+        self.assertContains(respuesta, reverse('web:pagoPedido'))
+        self.assertContains(respuesta, 'Completar mi pago')
+        self.assertContains(respuesta, str(pedido.monto_total))
+
+    def test_lleva_los_segundos_para_el_contador(self):
+        self._con_pedido()
+
+        respuesta = self._mirar()
+        segundos = respuesta.context['segundos_en_curso']
+        self.assertGreater(segundos, 0)
+        self.assertLessEqual(segundos, settings.MINUTOS_RESERVA * 60)
+
+    # --- cuando NO debe aparecer ---
+
+    def test_no_molesta_a_quien_no_tiene_nada_pendiente(self):
+        respuesta = self._mirar()
+
+        self.assertIsNone(respuesta.context['pedido_en_curso'])
+        self.assertNotContains(respuesta, 'Tenes un pedido esperando pago')
+
+    def test_no_se_repite_en_la_propia_pantalla_de_pago(self):
+        """ Ahi ya hay un contador: mostrar dos es ruido """
+        self._con_pedido()
+
+        respuesta = self.client.get(reverse('web:pagoPedido'))
+
+        self.assertIsNone(respuesta.context['pedido_en_curso'])
+        self.assertNotContains(respuesta, 'Completar mi pago')
+
+    def test_desaparece_cuando_el_pedido_avanza(self):
+        pedido = self._con_pedido()
+        pedido.declarar_pago(
+            cuenta=self.cuenta, monto_declarado=pedido.monto_total,
+            nro_operacion='OP-BANNER', voucher=_imagen(), fecha_pago=timezone.localdate(),
+        )
+
+        self.assertIsNone(self._mirar().context['pedido_en_curso'])
+
+    def test_desaparece_cuando_el_pedido_muere(self):
+        pedido = self._con_pedido()
+        pedido.expirar()
+
+        self.assertIsNone(self._mirar().context['pedido_en_curso'])
+
+    # --- el caso limite ---
+
+    def test_vencido_pero_sin_barrer_avisa_igual(self):
+        """
+        Entre que se cumple el plazo y algo lo barre, el aviso sigue saliendo con
+        cero segundos. El JS lo convierte en "se vencio" en vez de dejar un
+        contador congelado.
+        """
+        pedido = self._con_pedido()
+        Pedido.objects.filter(pk=pedido.pk).update(
+            reserva_vence=timezone.now() - timedelta(minutes=1)
+        )
+
+        respuesta = self._mirar()
+
+        self.assertIsNotNone(respuesta.context['pedido_en_curso'])
+        self.assertEqual(respuesta.context['segundos_en_curso'], 0)
+        self.assertContains(respuesta, 'data-segundos="0"')
+
+    def test_no_se_escapa_el_comentario_de_la_plantilla(self):
+        """
+        Regresion. El comentario iba con {# #}, que en Django es de UNA linea:
+        el resto se imprimia como texto arriba de la pagina. Los tests no lo
+        agarraron porque buscaban lo que TIENE que estar, no lo que no.
+        """
+        self._con_pedido()
+
+        cuerpo = self._mirar().content.decode()
+
+        self.assertNotIn('El camino de vuelta a la pantalla de pago', cuerpo)
+        self.assertNotIn('buscador de pedidos', cuerpo)
+
+    def test_una_sesion_no_ve_el_pedido_de_otra(self):
+        """ Se lee de la sesion: otro navegador no tiene por que enterarse """
+        self._con_pedido()
+
+        otro = Client()
+        self.assertIsNone(otro.get(reverse('web:index')).context['pedido_en_curso'])

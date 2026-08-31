@@ -66,6 +66,8 @@ TEMPLATES = [
                 'django.template.context_processors.request',
                 'django.contrib.auth.context_processors.auth',
                 'django.contrib.messages.context_processors.messages',
+                # el camino de vuelta al pedido a medio pagar, en todas las pantallas
+                'web.context_processors.pedido_en_curso',
             ],
         },
     },
