@@ -2664,9 +2664,9 @@ class AvisoDePagoTests(_AlmacenMixin, _VentaMixin, TestCase):
         mail.outbox = []
         self._declarar()
 
-        self.assertEqual(len(mail.outbox), 1)
-        aviso = mail.outbox[0]
-        self.assertEqual(aviso.to, ['jefe@goatx.pe'])
+        # dos correos: uno al equipo y otro al cliente
+        self.assertEqual(len(mail.outbox), 2)
+        aviso = next(m for m in mail.outbox if m.to == ['jefe@goatx.pe'])
         self.assertIn(self.pedido.nro_pedido, aviso.subject)
         self.assertIn('OP-AVISO', aviso.body)
         self.assertIn(str(settings.HORAS_VALIDACION), aviso.body)
@@ -2675,13 +2675,18 @@ class AvisoDePagoTests(_AlmacenMixin, _VentaMixin, TestCase):
     def test_el_correo_trae_el_enlace_para_validar(self):
         mail.outbox = []
         pago = self._declarar()
-        self.assertIn(reverse('web:validarPago', args=[pago.id]), mail.outbox[0].body)
+        equipo = next(m for m in mail.outbox if m.to == ['jefe@goatx.pe'])
+        self.assertIn(reverse('web:validarPago', args=[pago.id]), equipo.body)
 
     @override_settings(CORREOS_AVISO=[])
-    def test_sin_destinatarios_no_se_manda_nada(self):
+    def test_sin_destinatarios_el_equipo_no_recibe_nada(self):
+        """ Pero el cliente si: su correo no depende de la lista del equipo """
         mail.outbox = []
         self._declarar()
-        self.assertEqual(len(mail.outbox), 0)
+
+        self.assertEqual([m for m in mail.outbox if m.to == ['jefe@goatx.pe']], [])
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, [self.pedido.email_comprador])
 
 
 @ARCHIVOS_APARTE
@@ -4263,3 +4268,335 @@ class ContadorNoSeAdelantaTests(_AlmacenMixin, _VentaMixin, TestCase):
 
         # con truncado daba MINUTOS_RESERVA*60 - 1; ahora llega al valor entero
         self.assertEqual(pedido.segundos_restantes, settings.MINUTOS_RESERVA * 60)
+
+
+class ListadoDePedidosTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """
+    El listado de pedidos se escanea, no se lee.
+
+    No tenia orden declarado ni en el modelo ni en el admin, asi que MySQL
+    devolvia por insercion y lo primero que se veia al entrar era el pedido mas
+    viejo de todos. Y con 44 de 47 filas terminadas, las ventas reales quedaban
+    enterradas. Se resolvio con dos canales: color para que paso, negrita para
+    lo que espera una accion tuya.
+    """
+
+    URL = '/admin/web/pedido/'
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B210-1', [(self.t40, 6, Decimal('300.00'))], aplicar=True)
+        self.cuenta = _cuenta_bcp()
+        cache.clear()
+        self.client.force_login(
+            User.objects.create_superuser('jefa', 'jefa@goatx.pe', 'clave-de-prueba')
+        )
+
+    def _pedido(self, estado, dias_atras=0):
+        pedido = Pedido.objects.create(
+            codigo_reserva=f'R-LST{estado}{dias_atras}',
+            nombre_comprador='Ana', apellido_comprador='Perez',
+            email_comprador='a@b.pe', telefono_comprador='999',
+            modo_entrega=Pedido.ENVIO, monto_total=Decimal('100.00'), estado=estado,
+        )
+        if dias_atras:
+            Pedido.objects.filter(pk=pedido.pk).update(
+                fecha_registro=timezone.now() - timedelta(days=dias_atras)
+            )
+        return pedido
+
+    # --- el orden ---
+
+    def test_lo_mas_nuevo_va_primero(self):
+        viejo = self._pedido(Pedido.ENTREGADO, dias_atras=5)
+        nuevo = self._pedido(Pedido.ENTREGADO, dias_atras=0)
+
+        respuesta = self.client.get(self.URL)
+        cuerpo = respuesta.content.decode()
+
+        self.assertLess(cuerpo.index(nuevo.referencia), cuerpo.index(viejo.referencia))
+
+    # --- el color dice que paso ---
+
+    def test_cada_situacion_trae_su_color(self):
+        # el atributo completo: el fragmento 'sit-nada' tambien vive en el CSS
+        casos = {
+            Pedido.EN_VALIDACION: 'class="sit sit-accion"',
+            Pedido.PAGADO: 'class="sit sit-accion"',
+            Pedido.ENVIADO: 'class="sit sit-curso"',
+            Pedido.ENTREGADO: 'class="sit sit-bien"',
+            Pedido.SOLICITADO: 'class="sit sit-reserva"',
+            Pedido.EXPIRADO: 'class="sit sit-nada"',
+            Pedido.CANCELADO: 'class="sit sit-cerrado"',
+        }
+        for estado, clase in casos.items():
+            self._pedido(estado)
+
+        cuerpo = self.client.get(self.URL).content.decode()
+        for estado, clase in casos.items():
+            self.assertIn(clase, cuerpo, estado)
+
+    def test_el_expirado_no_se_pinta_de_alarma(self):
+        """
+        Es el estado mas numeroso y el que menos significa: una reserva vencida
+        no es una falla. Con el color de atencion, el listado quedaria en rojo y
+        el rojo dejaria de decir nada.
+        """
+        self._pedido(Pedido.EXPIRADO)
+
+        cuerpo = self.client.get(self.URL).content.decode()
+
+        self.assertIn('class="sit sit-nada"', cuerpo)
+        self.assertNotIn('class="sit sit-accion"', cuerpo)
+
+    # --- el negrita dice si te espera ---
+
+    def test_lo_que_espera_accion_se_marca(self):
+        self._pedido(Pedido.EN_VALIDACION)
+
+        cuerpo = self.client.get(self.URL).content.decode()
+
+        self.assertIn('class="sit sit-accion"', cuerpo)
+        self.assertIn(':has(.sit-accion)', cuerpo)      # la regla que engrosa la fila
+
+    def test_sin_nada_pendiente_no_hay_ninguna_marcada(self):
+        self._pedido(Pedido.ENTREGADO)
+        self._pedido(Pedido.EXPIRADO)
+        self._pedido(Pedido.CANCELADO)
+
+        cuerpo = self.client.get(self.URL).content.decode()
+
+        self.assertNotIn('class="sit sit-accion"', cuerpo)
+
+    # --- el filtro agrupado ---
+
+    def test_el_filtro_agrupa_por_lo_que_hay_que_hacer(self):
+        cuerpo = self.client.get(self.URL).content.decode()
+        for etiqueta in ('Necesita accion', 'En curso', 'Reservas vivas',
+                         'Terminadas bien', 'Sin venta'):
+            self.assertIn(etiqueta, cuerpo)
+
+    def test_el_grupo_sin_venta_junta_expirados_y_cancelados(self):
+        expirado = self._pedido(Pedido.EXPIRADO)
+        cancelado = self._pedido(Pedido.CANCELADO)
+        vivo = self._pedido(Pedido.ENTREGADO)
+
+        cuerpo = self.client.get(self.URL, {'situacion': 'sin_venta'}).content.decode()
+
+        self.assertIn(expirado.referencia, cuerpo)
+        self.assertIn(cancelado.referencia, cuerpo)
+        self.assertNotIn(vivo.referencia, cuerpo)
+
+    def test_sin_filtro_se_ve_todo(self):
+        """ No filtra por defecto: esconder filas genera "por que no aparece este pedido" """
+        expirado = self._pedido(Pedido.EXPIRADO)
+        entregado = self._pedido(Pedido.ENTREGADO)
+
+        cuerpo = self.client.get(self.URL).content.decode()
+
+        self.assertIn(expirado.referencia, cuerpo)
+        self.assertIn(entregado.referencia, cuerpo)
+
+
+class CorreosAlClienteTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """
+    Hasta ahora el cliente dejaba su correo en el checkout y no volvia a saber
+    de nosotros. Ni cuando confirmabamos su pago, ni cuando su pedido quedaba
+    esperandolo en el mostrador.
+    """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B220-1', [(self.t40, 6, Decimal('300.00'))], aplicar=True)
+        self.cuenta = _cuenta_bcp()
+        cache.clear()
+
+    def _pedido(self, recojo=False):
+        self._agregar(self.t40, 1)
+        self.client.get(reverse('web:continuarComoInvitado'))
+        datos = dict(DATOS_CHECKOUT)
+        if recojo:
+            datos['modo_entrega'] = Pedido.RECOJO
+            datos['punto_recojo'] = PuntoRecojo.objects.filter(activo=True).first().pk
+        self.client.post(reverse('web:registrarPedido'), datos)
+        return Pedido.objects.latest('id')
+
+    def _declarar(self, pedido, nro='OP-CORREO'):
+        with self.captureOnCommitCallbacks(execute=True):
+            return pedido.declarar_pago(
+                cuenta=self.cuenta, monto_declarado=pedido.monto_total,
+                nro_operacion=nro, voucher=_imagen(), fecha_pago=timezone.localdate(),
+            )
+
+    def _mover(self, pedido, estado):
+        with self.captureOnCommitCallbacks(execute=True):
+            pedido.cambiar_estado(estado)
+
+    def _al_cliente(self, pedido):
+        return [m for m in mail.outbox if m.to == [pedido.email_comprador]]
+
+    # --- comprobante recibido ---
+
+    def test_le_avisamos_que_su_comprobante_llego(self):
+        pedido = self._pedido()
+        mail.outbox = []
+        self._declarar(pedido)
+
+        pedido.refresh_from_db()
+        correo = self._al_cliente(pedido)[0]
+        self.assertIn('Recibimos tu comprobante', correo.subject)
+        self.assertIn(pedido.nro_pedido, correo.subject)
+        self.assertIn(str(settings.HORAS_VALIDACION), correo.body)
+
+    def test_el_correo_trae_el_detalle_y_el_total(self):
+        pedido = self._pedido()
+        mail.outbox = []
+        self._declarar(pedido)
+
+        cuerpo = self._al_cliente(pedido)[0].body
+        self.assertIn('Adidas Campus 00s', cuerpo)
+        self.assertIn(str(pedido.monto_total), cuerpo)
+
+    # --- pago confirmado ---
+
+    def test_le_avisamos_que_confirmamos_el_pago(self):
+        pedido = self._pedido()
+        self._declarar(pedido)
+        mail.outbox = []
+        self._mover(pedido, Pedido.PAGADO)
+
+        correo = self._al_cliente(pedido)[0]
+        self.assertIn('Confirmamos tu pago', correo.subject)
+        self.assertIn('preparando', correo.body)          # es envio
+
+    def test_con_recojo_le_dice_donde_lo_va_a_retirar(self):
+        pedido = self._pedido(recojo=True)
+        self._declarar(pedido, nro='OP-RECOJO')
+        mail.outbox = []
+        self._mover(pedido, Pedido.PAGADO)
+
+        self.assertIn(pedido.punto_recojo_nombre, self._al_cliente(pedido)[0].body)
+
+    # --- listo para recojo: el que mas falta hacia ---
+
+    def test_le_avisamos_que_su_pedido_lo_espera(self):
+        pedido = self._pedido(recojo=True)
+        self._declarar(pedido, nro='OP-ESPERA')
+        self._mover(pedido, Pedido.PAGADO)
+        mail.outbox = []
+        self._mover(pedido, Pedido.LISTO_RECOJO)
+
+        correo = self._al_cliente(pedido)[0]
+        self.assertIn('te espera', correo.subject)
+        self.assertIn(pedido.punto_recojo_nombre, correo.body)
+        self.assertIn(pedido.punto_recojo_direccion, correo.body)
+        self.assertIn('documento', correo.body)
+
+    def test_el_correo_de_recojo_trae_el_horario(self):
+        punto = PuntoRecojo.objects.filter(activo=True).first()
+        punto.horario = 'Lun a Sab de 9:00 a 19:00'
+        punto.save(update_fields=['horario'])
+
+        pedido = self._pedido(recojo=True)
+        self._declarar(pedido, nro='OP-HORARIO')
+        self._mover(pedido, Pedido.PAGADO)
+        mail.outbox = []
+        self._mover(pedido, Pedido.LISTO_RECOJO)
+
+        self.assertIn('Lun a Sab de 9:00 a 19:00', self._al_cliente(pedido)[0].body)
+
+    # --- enviado ---
+
+    def test_le_avisamos_que_salio(self):
+        pedido = self._pedido()
+        self._declarar(pedido, nro='OP-ENVIO')
+        self._mover(pedido, Pedido.PAGADO)
+        mail.outbox = []
+        self._mover(pedido, Pedido.ENVIADO)
+
+        correo = self._al_cliente(pedido)[0]
+        self.assertIn('va en camino', correo.subject)
+        self.assertIn(pedido.direccion_envio, correo.body)
+
+    # --- rechazado ---
+
+    def test_el_rechazo_le_dice_por_que_y_como_seguir(self):
+        pedido = self._pedido()
+        pago = self._declarar(pedido, nro='OP-RECHAZO')
+        mail.outbox = []
+        with self.captureOnCommitCallbacks(execute=True):
+            pago.rechazar('La captura no deja ver el monto')
+
+        correo = self._al_cliente(pedido)[0]
+        self.assertIn('No pudimos confirmar tu pago', correo.subject)
+        self.assertIn('La captura no deja ver el monto', correo.body)
+        self.assertIn('devolucion', correo.body)
+
+    # --- lo que NO debe pasar ---
+
+    def test_al_entregar_le_pedimos_que_avise_si_no_lo_recibio(self):
+        """
+        Marcar como entregado es el unico paso que hacemos nosotros solos. Sin
+        este correo, un error nuestro -- el pedido que no era, el motorizado que
+        dijo que entrego -- solo se descubre cuando el cliente reclama.
+        """
+        pedido = self._pedido()
+        self._declarar(pedido, nro='OP-FIN')
+        self._mover(pedido, Pedido.PAGADO)
+        self._mover(pedido, Pedido.ENVIADO)
+        mail.outbox = []
+        self._mover(pedido, Pedido.ENTREGADO)
+
+        correo = self._al_cliente(pedido)[0]
+        self.assertIn('Entregamos tu pedido', correo.subject)
+        self.assertIn('Si no lo recibiste', correo.body)
+        self.assertIn(pedido.direccion_envio, correo.body)
+
+    def test_el_de_entrega_por_recojo_dice_donde_lo_retiro(self):
+        pedido = self._pedido(recojo=True)
+        self._declarar(pedido, nro='OP-FIN-R')
+        self._mover(pedido, Pedido.PAGADO)
+        self._mover(pedido, Pedido.LISTO_RECOJO)
+        mail.outbox = []
+        self._mover(pedido, Pedido.ENTREGADO)
+
+        cuerpo = self._al_cliente(pedido)[0].body
+        self.assertIn('Lo retiraste en', cuerpo)
+        self.assertIn(pedido.punto_recojo_nombre, cuerpo)
+
+    def test_todos_traen_el_enlace_al_asesor(self):
+        pedido = self._pedido()
+        mail.outbox = []
+        self._declarar(pedido, nro='OP-ASESOR')
+
+        self.assertIn(settings.WHATSAPP_ASESOR, self._al_cliente(pedido)[0].body)
+
+    def test_el_correo_va_con_fail_silently(self):
+        """
+        Que el servidor de correo este caido no puede impedir que se confirme un
+        pago. Se verifica el contrato -- que pedimos `fail_silently` -- y no que
+        Django lo cumpla, que es cosa suya.
+        """
+        from unittest.mock import patch
+
+        pedido = self._pedido()
+        self._declarar(pedido, nro='OP-CAIDO')
+
+        with patch('web.avisos.send_mail') as enviar:
+            with self.captureOnCommitCallbacks(execute=True):
+                pedido.cambiar_estado(Pedido.PAGADO)
+
+        self.assertTrue(enviar.called)
+        for llamada in enviar.call_args_list:
+            self.assertTrue(llamada.kwargs.get('fail_silently'))
+
+    def test_el_correo_sale_recien_al_confirmar_la_transaccion(self):
+        """ Si la venta se cae, no puede haber salido un correo diciendo que ocurrio """
+        pedido = self._pedido()
+        self._declarar(pedido, nro='OP-COMMIT')
+        mail.outbox = []
+
+        # sin ejecutar los callbacks, no hay correo todavia
+        with self.captureOnCommitCallbacks(execute=False):
+            pedido.cambiar_estado(Pedido.PAGADO)
+        self.assertEqual(self._al_cliente(pedido), [])

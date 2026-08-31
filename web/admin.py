@@ -455,16 +455,76 @@ class PedidoDetalleInline(admin.TabularInline):
         return False
 
 
+class SituacionFilter(admin.SimpleListFilter):
+    """
+    Agrupa los estados por lo que hay que hacer con ellos.
+
+    Filtrar por "Expirado" contra "Cancelado" no es la pregunta que uno se hace
+    al abrir el listado. La pregunta es que necesita accion. No filtra por
+    defecto a proposito: esconder filas genera el problema de "por que no
+    aparece este pedido", y para eso ya estan el orden y el resaltado.
+    """
+
+    title = 'situacion'
+    parameter_name = 'situacion'
+
+    GRUPOS = {
+        'accion': ('Necesita accion', (Pedido.EN_VALIDACION, Pedido.PAGADO)),
+        'curso': ('En curso', (Pedido.ENVIADO, Pedido.LISTO_RECOJO)),
+        'reserva': ('Reservas vivas', (Pedido.SOLICITADO,)),
+        'bien': ('Terminadas bien', (Pedido.ENTREGADO,)),
+        'sin_venta': ('Sin venta', (Pedido.EXPIRADO, Pedido.CANCELADO)),
+    }
+
+    def lookups(self, request, model_admin):
+        return [(clave, etiqueta) for clave, (etiqueta, _) in self.GRUPOS.items()]
+
+    def queryset(self, request, queryset):
+        grupo = self.GRUPOS.get(self.value())
+        return queryset.filter(estado__in=grupo[1]) if grupo else queryset
+
+
 @admin.register(Pedido)
 class PedidoAdmin(admin.ModelAdmin):
+    # Lo ultimo arriba. Antes no habia orden declarado ni en el modelo ni aca,
+    # asi que MySQL devolvia por insercion: lo primero que se veia al entrar era
+    # el pedido mas viejo de todos.
+    ordering = ('-fecha_registro',)
+
     list_display = ('referencia', 'nombre_comprador', 'apellido_comprador', 'monto_total',
-                    'estado', 'entrega', 'es_invitado', 'fecha_registro')
-    list_filter = ('estado', 'modo_entrega', 'punto_recojo')
+                    'situacion', 'entrega', 'es_invitado', 'fecha_registro')
+    list_filter = (SituacionFilter, 'estado', 'modo_entrega', 'punto_recojo')
     search_fields = ('nro_pedido', 'codigo_reserva', 'email_comprador',
                      'nombre_comprador', 'apellido_comprador')
     inlines = [PedidoDetalleInline]
     actions = ['marcar_enviado', 'agregar_a_traslado', 'marcar_listo_recojo',
                'marcar_entregado', 'cancelar_pedido']
+
+    # Dos preguntas distintas, dos canales distintos. El color dice QUE PASO; el
+    # negrita de la fila (en el CSS del change_list) dice SI TE ESPERA A VOS.
+    #
+    # El gris del expirado es deliberado: es el estado mas numeroso y el que
+    # menos significa. Una reserva vencida no es una falla, es alguien que miro
+    # y se fue. Pintarla de rojo dejaria el listado en rojo y el rojo, que en
+    # este proyecto ya significa "mira esto", dejaria de significar nada.
+    SITUACION = {
+        Pedido.EN_VALIDACION: ('accion', '#b5541b'),
+        Pedido.PAGADO: ('accion', '#b5541b'),
+        Pedido.ENVIADO: ('curso', '#2b5a88'),
+        Pedido.LISTO_RECOJO: ('curso', '#2b5a88'),
+        Pedido.ENTREGADO: ('bien', '#3e7a4c'),
+        Pedido.SOLICITADO: ('reserva', '#6a6a6a'),
+        Pedido.EXPIRADO: ('nada', '#9a9a9a'),
+        Pedido.CANCELADO: ('cerrado', '#a8724f'),
+    }
+
+    @admin.display(description='Situacion', ordering='estado')
+    def situacion(self, obj):
+        clase, color = self.SITUACION.get(obj.estado, ('', '#6a6a6a'))
+        return format_html(
+            '<span class="sit sit-{}" style="color:{};border-color:{}">{}</span>',
+            clase, color, color, obj.get_estado_display(),
+        )
 
     # El estado no se escribe a mano: ponerlo en "Cancelado" desde el formulario
     # dejaria el stock descontado para siempre. Se mueve con las acciones.

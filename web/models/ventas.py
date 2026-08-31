@@ -8,7 +8,14 @@ from django.conf import settings
 from django.db import IntegrityError, models, transaction
 from django.utils import timezone
 
-from ..avisos import avisar_pago_declarado
+from ..avisos import (
+    avisar_comprobante_recibido,
+    avisar_enviado,
+    avisar_entregado,
+    avisar_listo_para_recojo,
+    avisar_pago_confirmado,
+    avisar_pago_declarado,
+)
 from .inventario import Inventario
 from .kardex import MovimientoInventario
 
@@ -355,6 +362,8 @@ class Pedido(models.Model):
             # enterarse es lo que hace la diferencia entre validar en minutos y
             # validar al dia siguiente
             avisar_pago_declarado(pago, base_url=base_url)
+            # y al cliente, que acaba de hacer su parte y quiere saber que llego
+            avisar_comprobante_recibido(self)
         return pago
 
     def confirmar_venta(self, usuario=None):
@@ -471,6 +480,16 @@ class Pedido(models.Model):
         if nuevo == self.CANCELADO:
             return self.cancelar(motivo, usuario=usuario)
 
+        # los tres momentos en que al cliente le cambia algo que le importa.
+        # Van aca y no en cada accion del admin: asi da igual por donde se mueva
+        # el pedido -- pantalla, accion, comando -- que el aviso sale igual
+        avisos_al_cliente = {
+            self.PAGADO: avisar_pago_confirmado,
+            self.LISTO_RECOJO: avisar_listo_para_recojo,
+            self.ENVIADO: avisar_enviado,
+            self.ENTREGADO: avisar_entregado,
+        }
+
         with transaction.atomic():
             self.estado = nuevo
             self.save(update_fields=['estado'])
@@ -479,6 +498,10 @@ class Pedido(models.Model):
                 # venga: asi no se puede llegar a Pagado con las unidades todavia
                 # reservadas y sin registrar en el kardex
                 self.confirmar_venta(usuario=usuario)
+
+            aviso = avisos_al_cliente.get(nuevo)
+            if aviso is not None:
+                aviso(self)
         return self
 
     def cancelar(self, motivo, usuario=None, estado_final=None):

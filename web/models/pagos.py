@@ -16,6 +16,8 @@ from django.core.files.storage import FileSystemStorage
 from django.db import models, transaction
 from django.utils import timezone
 
+from ..avisos import avisar_comprobante_rechazado
+
 
 class AlmacenPrivado(FileSystemStorage):
     """
@@ -323,4 +325,8 @@ class Pago(models.Model):
             pedido = self.pedido
             if not pedido.cerrado_sin_venta:
                 pedido.cancelar(f'Comprobante rechazado: {motivo}', usuario=usuario)
+
+            # el correo mas delicado: el cliente cree que pago y se entera de
+            # que su pedido se cerro. Tiene que decir por que y como seguir
+            avisar_comprobante_rechazado(pedido, motivo)
         return self

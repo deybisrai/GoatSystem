@@ -169,9 +169,27 @@ HORAS_ALERTA_VALIDACION = 6
 # resuelve una pantalla. Formato internacional, sin + ni espacios.
 WHATSAPP_ASESOR = '51955134139'
 
-# A quien se le avisa cuando llega un comprobante. En desarrollo el correo sale
-# por consola; el SMTP real se configura en la fase 8, que igual hace falta para
-# escribirle al cliente.
-EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
-DEFAULT_FROM_EMAIL = 'GOAT X <no-responder@goatx.pe>'
-CORREOS_AVISO = ['deybis.cc@hotmail.com']
+# Con que direccion se arman los enlaces de los correos. Un aviso disparado
+# desde el admin o desde un comando no tiene request de donde sacarla.
+URL_SITIO = os.environ.get('GOATX_URL_SITIO', 'http://localhost:8001')
+
+# El correo real se enciende poniendo GOATX_EMAIL_HOST en el entorno. Sin esa
+# variable todo sale por consola y no se le manda nada a nadie, que es lo que
+# corresponde en desarrollo. Las credenciales NO van en este archivo: van en el
+# entorno, porque este archivo esta en el repositorio.
+EMAIL_HOST = os.environ.get('GOATX_EMAIL_HOST', '')
+EMAIL_PORT = int(os.environ.get('GOATX_EMAIL_PORT', '587'))
+EMAIL_HOST_USER = os.environ.get('GOATX_EMAIL_USER', '')
+EMAIL_HOST_PASSWORD = os.environ.get('GOATX_EMAIL_PASSWORD', '')
+EMAIL_USE_TLS = os.environ.get('GOATX_EMAIL_TLS', '1') == '1'
+EMAIL_TIMEOUT = 20
+
+EMAIL_BACKEND = (
+    'django.core.mail.backends.smtp.EmailBackend' if EMAIL_HOST
+    else 'django.core.mail.backends.console.EmailBackend'
+)
+DEFAULT_FROM_EMAIL = os.environ.get('GOATX_EMAIL_FROM', 'GOAT X <no-responder@goatx.pe>')
+# El correo de la empresa. Se puede poner mas de uno; les llega a todos.
+CORREOS_AVISO = os.environ.get(
+    'GOATX_CORREOS_AVISO', 'monetix.r@hotmail.com'
+).split(',')

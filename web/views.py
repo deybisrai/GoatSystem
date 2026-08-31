@@ -1,4 +1,3 @@
-from urllib.parse import quote
 from uuid import uuid4
 
 from django.conf import settings
@@ -11,6 +10,7 @@ from django.http import FileResponse, Http404, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 
+from .avisos import enlace_whatsapp as _whatsapp
 from .carrito import Cart
 from .disponibilidad import para_carrito
 from .forms import ClienteForm, PagoForm, PedidoForm, RechazoForm, ValidacionForm
@@ -347,23 +347,6 @@ def _datos_pedido(usuario):
 
 
 CLAVE_INVITADO = 'compra_como_invitado'
-
-
-def _whatsapp(pedido=None):
-    """
-    Enlace al asesor, con el pedido ya escrito en el mensaje.
-
-    Lo que una pantalla no resuelve -- una devolucion, un caso raro -- lo
-    atiende una persona. Que el cliente no tenga que explicar cual es su pedido
-    es la diferencia entre que escriba y que abandone.
-    """
-    numero = getattr(settings, 'WHATSAPP_ASESOR', '')
-    if not numero:
-        return ''
-    texto = 'Hola, necesito ayuda con mi pedido'
-    if pedido is not None:
-        texto = f'{texto} {pedido.referencia}'
-    return f'https://wa.me/{numero}?text={quote(texto)}'
 
 
 def identificarse(request):

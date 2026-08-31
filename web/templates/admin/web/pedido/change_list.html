@@ -1,0 +1,45 @@
+{% extends "admin/change_list.html" %}
+
+{#
+    El listado de pedidos se escanea, no se lee. Dos canales de informacion:
+
+      color   ->  que paso con el pedido (chip en la columna Situacion)
+      negrita ->  si te esta esperando a vos
+
+    El negrita de la fila entera sale de `:has()`, sin tocar la plantilla de
+    filas de Django ni sumar JavaScript. Si el navegador no lo soporta, el chip
+    de color sigue diciendo lo mismo: no se pierde informacion, solo el enfasis.
+#}
+
+{% block extrastyle %}
+{{ block.super }}
+<style>
+    /* el chip de situacion */
+    #changelist .sit {
+        display: inline-block;
+        padding: 1px 8px;
+        border: 1px solid;
+        border-radius: 10px;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: .02em;
+        white-space: nowrap;
+        line-height: 1.7;
+    }
+    /* lo terminado no compite por la atencion: mismo chip, mas apagado */
+    #changelist .sit-nada,
+    #changelist .sit-cerrado,
+    #changelist .sit-bien { opacity: .78; }
+
+    /* la fila que espera algo tuyo. El chip .sit-accion es la marca */
+    #changelist #result_list tbody tr:has(.sit-accion) > * {
+        font-weight: 700;
+    }
+    #changelist #result_list tbody tr:has(.sit-accion) {
+        background: rgba(181, 84, 27, .05);
+    }
+
+    /* los codigos R- y los numeros P... se leen mejor tabulares */
+    #changelist #result_list tbody th a { font-variant-numeric: tabular-nums; }
+</style>
+{% endblock %}
