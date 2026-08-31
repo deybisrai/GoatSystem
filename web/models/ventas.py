@@ -577,17 +577,25 @@ class Pedido(models.Model):
 
         return self
 
-    def expirar(self, usuario=None):
+    MOTIVO_PLAZO = 'Vencio el plazo para pagar'
+
+    def expirar(self, usuario=None, motivo=None):
         """
-        Se le acabo el plazo sin comprobante: suelta las unidades y se cierra.
+        La reserva no llego a ser venta: suelta las unidades y se cierra.
 
         Hace lo mismo que cancelar -- devuelve el stock, libera el cupon,
         conserva el detalle -- pero aterriza en EXPIRADO. La diferencia no es
         cosmetica: un expirado es un cliente que no llego, y eso se cuenta
         aparte de los que cancelamos nosotros.
+
+        El motivo se puede cambiar porque hay mas de una forma de no llegar. La
+        comun es que se acabe el plazo; la otra es que el mismo cliente arranque
+        de nuevo y esta reserva quede reemplazada. El final es el mismo -- no
+        fue venta -- y por eso comparten estado; lo que cambia es el por que, y
+        eso queda escrito.
         """
         return self.cancelar(
-            'Vencio el plazo para pagar', usuario=usuario, estado_final=self.EXPIRADO
+            motivo or self.MOTIVO_PLAZO, usuario=usuario, estado_final=self.EXPIRADO
         )
 
 

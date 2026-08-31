@@ -4723,3 +4723,140 @@ class AvisoPedidoEnCursoTests(_AlmacenMixin, _VentaMixin, TestCase):
 
         otro = Client()
         self.assertIsNone(otro.get(reverse('web:index')).context['pedido_en_curso'])
+
+
+class ReservaReemplazadaTests(_AlmacenMixin, _VentaMixin, TestCase):
+    """
+    Un pedido nuevo suelta la reserva anterior de la misma sesion.
+
+    Antes se creaban los dos y el viejo quedaba huerfano: retenia sus unidades
+    diez minutos pero el cliente ya no podia llegar a el -- la sesion, el aviso
+    y /pago apuntaban todos al nuevo. Nadie iba a pagarlo nunca; solo bloqueaba
+    inventario. Y no habia limite: cinco vueltas, cinco reservas vivas.
+    """
+
+    def setUp(self):
+        self._montar_almacen()
+        self._compra('B240-1', [(self.t40, 6, Decimal('300.00'))], aplicar=True)
+        self.cuenta = _cuenta_bcp()
+        cache.clear()
+
+    def _otro_pedido(self, cantidad=1):
+        self._agregar(self.t40, cantidad)
+        self.client.get(reverse('web:continuarComoInvitado'))
+        self.client.post(reverse('web:registrarPedido'), DATOS_CHECKOUT)
+        return Pedido.objects.latest('id')
+
+    # --- el caso que motivo el cambio ---
+
+    def test_el_pedido_nuevo_suelta_la_reserva_anterior(self):
+        primero = self._otro_pedido(1)
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.reservado, 1)
+
+        segundo = self._otro_pedido(2)
+
+        primero.refresh_from_db()
+        self.t40.refresh_from_db()
+        self.assertEqual(primero.estado, Pedido.EXPIRADO)
+        self.assertEqual(segundo.estado, Pedido.SOLICITADO)
+        self.assertEqual(self.t40.reservado, 2)      # solo las del nuevo
+        self.assertEqual(Pedido.objects.filter(estado=Pedido.SOLICITADO).count(), 1)
+
+    def test_el_motivo_nombra_al_que_lo_reemplazo(self):
+        primero = self._otro_pedido()
+        segundo = self._otro_pedido()
+
+        primero.refresh_from_db()
+        self.assertIn('Reemplazada', primero.motivo_cancelacion)
+        self.assertIn(segundo.codigo_reserva, primero.motivo_cancelacion)
+
+    def test_se_lo_dice_al_cliente(self):
+        primero = self._otro_pedido()
+
+        self._agregar(self.t40, 1)
+        self.client.get(reverse('web:continuarComoInvitado'))
+        respuesta = self.client.post(reverse('web:registrarPedido'), DATOS_CHECKOUT, follow=True)
+
+        # contra el mensaje y no contra el HTML: la plantilla pasa los avisos por
+        # escapejs, que convierte el guion en -. El navegador lo muestra
+        # bien, pero en el HTML crudo el codigo no aparece literal
+        avisos = [str(m) for m in respuesta.context['messages']]
+        self.assertTrue(any('Soltamos tu reserva anterior' in a for a in avisos), avisos)
+        self.assertTrue(any(primero.codigo_reserva in a for a in avisos), avisos)
+
+    def test_encadenados_solo_queda_el_ultimo(self):
+        uno = self._otro_pedido()
+        dos = self._otro_pedido()
+        tres = self._otro_pedido()
+
+        for p in (uno, dos, tres):
+            p.refresh_from_db()
+        self.assertEqual(uno.estado, Pedido.EXPIRADO)
+        self.assertEqual(dos.estado, Pedido.EXPIRADO)
+        self.assertEqual(tres.estado, Pedido.SOLICITADO)
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.reservado, 1)
+
+    # --- lo que NO debe tocar ---
+
+    def test_no_toca_una_reserva_que_ya_tiene_comprobante(self):
+        """ En validacion hay plata de por medio: eso no se suelta solo """
+        primero = self._otro_pedido()
+        primero.declarar_pago(
+            cuenta=self.cuenta, monto_declarado=primero.monto_total,
+            nro_operacion='OP-NO-TOCAR', voucher=_imagen(), fecha_pago=timezone.localdate(),
+        )
+
+        self._otro_pedido()
+
+        primero.refresh_from_db()
+        self.assertEqual(primero.estado, Pedido.EN_VALIDACION)
+        self.t40.refresh_from_db()
+        self.assertEqual(self.t40.reservado, 2)      # la del comprobante sigue viva
+
+    def test_no_toca_pedidos_de_otra_sesion(self):
+        otro_cliente = Client()
+        otro_cliente.post(reverse('web:agregarCarrito'), {
+            'item_id': self.t40.id, 'cantidad': 1, 'sku': self.t40.variante.sku,
+        })
+        otro_cliente.get(reverse('web:continuarComoInvitado'))
+        otro_cliente.post(reverse('web:registrarPedido'), DATOS_CHECKOUT)
+        ajeno = Pedido.objects.latest('id')
+
+        self._otro_pedido()
+
+        ajeno.refresh_from_db()
+        self.assertEqual(ajeno.estado, Pedido.SOLICITADO)
+
+    def test_el_primer_pedido_no_expira_nada(self):
+        pedido = self._otro_pedido()
+
+        self.assertEqual(pedido.estado, Pedido.SOLICITADO)
+        self.assertEqual(Pedido.objects.filter(estado=Pedido.EXPIRADO).count(), 0)
+
+    def test_un_reenvio_idempotente_no_se_expira_a_si_mismo(self):
+        """ El doble clic devuelve el MISMO pedido: no hay anterior que soltar """
+        self._agregar(self.t40, 1)
+        self.client.get(reverse('web:continuarComoInvitado'))
+        datos = dict(DATOS_CHECKOUT, token_checkout='tok-reenvio')
+        self.client.post(reverse('web:registrarPedido'), datos)
+        pedido = Pedido.objects.get()
+
+        self._agregar(self.t40, 1)
+        self.client.get(reverse('web:continuarComoInvitado'))
+        self.client.post(reverse('web:registrarPedido'), datos)
+
+        pedido.refresh_from_db()
+        self.assertEqual(pedido.estado, Pedido.SOLICITADO)
+        self.assertEqual(Pedido.objects.count(), 1)
+
+    # --- y el aviso flotante sigue apuntando bien ---
+
+    def test_el_aviso_apunta_al_pedido_nuevo(self):
+        self._otro_pedido()
+        segundo = self._otro_pedido()
+
+        respuesta = self.client.get(reverse('web:index'))
+
+        self.assertEqual(respuesta.context['pedido_en_curso'].pk, segundo.pk)

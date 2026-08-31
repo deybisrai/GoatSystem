@@ -388,6 +388,25 @@ def registrarPedido(request):
                 messages.error(request, str(problema))
                 return redirect('web:carrito')
 
+            # El cliente arranco de nuevo, asi que su reserva anterior ya no
+            # tiene sentido: nadie la va a pagar y estaria reteniendo unidades
+            # diez minutos mas. Solo se suelta lo que sigue en SOLICITADO -- una
+            # que ya tiene comprobante tiene plata detras y no se toca.
+            anterior_id = request.session.get('ultimo_pedido')
+            if anterior_id and anterior_id != pedido.id:
+                anterior = Pedido.objects.filter(
+                    pk=anterior_id, estado=Pedido.SOLICITADO
+                ).first()
+                if anterior is not None:
+                    anterior.expirar(
+                        motivo=f'Reemplazada por la reserva {pedido.codigo_reserva}'
+                    )
+                    messages.info(
+                        request,
+                        f'Soltamos tu reserva anterior {anterior.codigo_reserva}. '
+                        'Este pedido la reemplaza.',
+                    )
+
             carrito_actual.clear()
             request.session.pop(CLAVE_INVITADO, None)
             request.session['ultimo_pedido'] = pedido.id
