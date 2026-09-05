@@ -9,7 +9,7 @@ Roadmap y estado: https://claude.ai/code/artifact/882e8434-8427-496c-b736-c8fc63
 
 ```bash
 venv/Scripts/python.exe manage.py runserver
-venv/Scripts/python.exe manage.py test web      # 284 tests
+venv/Scripts/python.exe manage.py test web      # 386 tests
 venv/Scripts/python.exe manage.py verificar_kardex   # stock vs historial
 venv/Scripts/python.exe manage.py vencer_reservas    # suelta lo no pagado a tiempo
 venv/Scripts/python.exe manage.py programar_transportes  # que ninguna ciudad quede sin viaje
@@ -127,14 +127,59 @@ dos ciudades.
 
 **Un pedido reserva, no descuenta.** `crear_pedido()` llama a
 `Inventario.reservar()`, que sube `reservado` sin tocar `stock` ni el kardex. El
-pedido nace con `reserva_vence` (`MINUTOS_RESERVA`, hoy 15). Enviar el
-comprobante detiene ese reloj y lo cambia por el nuestro (`HORAS_VALIDACION`).
-Solo `cambiar_estado(PAGADO)` convierte la reserva en venta, y es el unico lugar
+pedido nace con `reserva_vence` (`MINUTOS_RESERVA`, hoy 10). Solo
+`cambiar_estado(PAGADO)` convierte la reserva en venta, y es el unico lugar
 donde eso pasa, venga por donde venga.
+
+**Una reserva vencida deja de contar al leer, no cuando alguien la barre.**
+`disponible = stock - reservado + reservado_vencido`. El contador `reservado`
+solo baja cuando se cancela el pedido, asi que sin ese tercer termino la ultima
+unidad quedaba trabada para siempre: el catalogo la daba por agotada, el carrito
+no dejaba agregarla, y lo unico que la soltaba vivia detras del checkout, al que
+no se llegaba. **El plazo se cumple con el reloj; el papeleo puede esperar.**
+
+**Con el comprobante arriba, la unidad se congela sin plazo.** `declarar_pago()`
+apaga `reserva_vence` en vez de reprogramarlo. `HORAS_VALIDACION` es la promesa
+que le mostramos al cliente, no un vencimiento: el ya transfirio, y soltarle la
+unidad porque nosotros tardamos seria castigarlo por nuestra demora. Lo que si
+corre es `HORAS_ALERTA_VALIDACION`, que pinta el pago como demorado en la bandeja.
+
+**Dos identificadores, y la diferencia importa.** `codigo_reserva` (`R-A3F9C2D1`)
+nace al confirmar el checkout y **no es correlativo**: un carrito abandonado no
+tiene por que gastarse un numero de la serie. `nro_pedido` (`P20260830-00001`) se
+emite recien al recibir el comprobante, es correlativo por dia, y **una vez
+emitido no se reutiliza jamas** aunque el pedido se cancele. `referencia` devuelve
+el que corresponda.
+
+**Se le acabo el tiempo no es lo mismo que lo cancelaron.** `EXPIRADO` es el
+cliente que no llego; `CANCELADO` es una decision de alguien -- un comprobante
+rechazado o el admin. Se cuentan por separado: sin eso no hay forma de medir si
+el plazo esta bien puesto. `cerrado_sin_venta` los agrupa cuando conviene
+tratarlos igual.
+
+**Un comprobante solo existe sobre un pedido vivo.** `declarar_pago()` se niega
+sobre uno expirado o cancelado, y validar tampoco lo resucita. Si el cliente
+pago de verdad, rehace la compra y sube el mismo voucher sobre el pedido nuevo;
+si otro se llevo la unidad, lo resuelve un asesor por WhatsApp. Antes habia un
+`revivir_por_pago_tardio()` que lo traia de vuelta solo, y era la unica
+transicion del proyecto que iba para atras.
+
+**El mismo clic no crea dos pedidos.** El formulario del checkout lleva un
+`token_checkout` oculto y unico en base. El bloqueo de filas impide que dos
+clientes se lleven la misma unidad; esto impide que un cliente se lleve dos
+pedidos por apretar dos veces. Son problemas distintos. La garantia esta en el
+`unique` y no en una consulta previa: entre consultar y crear hay una rendija.
+
+**Un pedido nuevo suelta la reserva anterior de la misma sesion.** El cliente
+que vuelve al catalogo y arranca de nuevo dejaba la reserva vieja huerfana:
+retenia unidades diez minutos, pero la sesion, el aviso y `/pago` apuntaban todos
+al nuevo, asi que nadie iba a pagarla. Y no habia limite: cinco vueltas, cinco
+reservas vivas. La vieja termina en `EXPIRADO` con el motivo diciendo cual la
+reemplazo. **La que ya tiene comprobante no se toca**: ahi hay plata de por medio.
 
 **Un plazo corto es peor que uno largo.** Si la reserva vence a mitad de la
 transferencia, el cliente ya movio plata y hay que devolversela. Un plazo largo
-solo bloquea una unidad un rato. Por eso 15 minutos y no 3.
+solo bloquea una unidad un rato.
 
 **El stock solo se mueve por `Inventario.registrar_movimiento()`.** Relee la
 fila con `select_for_update()` dentro de la transaccion, recalcula el costo
@@ -199,6 +244,22 @@ al vuelo; asi no hay que acordarse de revertir precios cuando termina la campana
   (`.entrega-envio[hidden]`), que gana por especificidad sin `!important`.
 - **Agregar un templatetag nuevo exige reiniciar el servidor.** Django carga las
   librerias al arrancar.
+- **`{# #}` es un comentario de UNA linea.** Con varias, Django imprime el resto
+  como texto en la pagina. Los multilinea van con `{% comment %}`. Paso en el
+  aviso flotante y se vio recien mirando la pantalla.
+- **Los nombres de `@keyframes` son globales.** Redefinir uno dentro de un media
+  query no lo acota a ese ancho. Y una animacion nunca deberia tocar `transform`
+  si el `transform` es lo que posiciona al elemento: el aviso flotante quedaba
+  14px corrido y se salia de la pantalla en celular.
+- **Un test puede fijar un bug en vez de un comportamiento.** Habia uno que
+  afirmaba que una reserva vencida seguia bloqueando su unidad. Pasaba en verde y
+  documentaba el defecto como si fuera la regla.
+- **Los tests prueban las piezas; los defectos viven en la costura.** Los cuatro
+  problemas mas serios de la fase 7 se encontraron mirando datos reales o
+  probando en el navegador, no corriendo la suite.
+- **`escapejs` convierte el guion en `\u002D`.** Un codigo `R-XXXX` no aparece
+  literal en el HTML de un mensaje flash. El navegador lo muestra bien; los tests
+  tienen que mirar el mensaje, no el HTML.
 
 ## Archivos
 
@@ -217,7 +278,9 @@ al vuelo; asi no hay que acordarse de revertir precios cuando termina la campana
 | `web/models/promociones.py`| Campana, Cupon |
 | `web/carrito.py`           | Carrito en sesion |
 | `web/pedidos.py`           | Convierte el carrito en venta. Aparte de views porque el POS lo reutilizara |
-| `web/avisos.py`            | Avisa por correo que llego un comprobante por validar |
+| `web/avisos.py`            | Los seis correos al cliente, el aviso al equipo y el enlace al asesor |
+| `web/middleware.py`        | Barre las reservas vencidas con el trafico normal |
+| `web/context_processors.py`| El aviso flotante del pedido que quedo esperando pago |
 | `web/management/commands/verificar_kardex.py` | Compara el saldo cacheado contra el historial |
 | `web/management/commands/vencer_reservas.py` | Suelta las reservas de los pedidos que no pagaron a tiempo |
 | `web/management/commands/programar_transportes.py` | Programa el proximo viaje a la ciudad que no lo tenga |
@@ -225,14 +288,15 @@ al vuelo; asi no hay que acordarse de revertir precios cuando termina la campana
 
 ## Estado
 
-**6 de 11 fases cerradas y la 7 practicamente terminada.** 284 tests, 23 modelos,
-28 migraciones. La tienda vende, cobra y entrega de punta a punta:
+**6 de 11 fases cerradas y la 7 practicamente terminada.** 386 tests, 23 modelos,
+33 migraciones. La tienda vende, cobra y entrega de punta a punta:
 
 - catalogo con variantes, carrito, cupones y checkout de invitado
 - ciclo auditable: cada unidad tiene un documento detras (fase 6)
 - cobro por transferencia con validacion humana (fase 7)
 - entrega a domicilio o recojo en cuatro mostradores
 - stock por ciudad y transporte entre ellas
+- al cliente se le escribe en cada paso, sin que tenga que preguntar
 
 Falta para lanzar: **8 seguridad** y **9 despliegue**. Despues 10 panel
 administrativo (Django + HTMX) y 11 punto de venta con caja y boveda.
@@ -269,32 +333,82 @@ Cuentas cargadas (editables desde el admin, sembradas en la 0017):
 | Yape | 955134139 |
 | BCP corriente | 3507296754036, CCI 00235000729675403679 |
 
-**Plazos** (en `settings.py`): `MINUTOS_RESERVA` 15, `HORAS_VALIDACION` 12,
-`HORAS_ALERTA_VALIDACION` 6.
+**Plazos** (en `settings.py`): `MINUTOS_RESERVA` 10, `HORAS_VALIDACION` 12,
+`HORAS_ALERTA_VALIDACION` 6, `SEGUNDOS_ENTRE_BARRIDOS` 60.
+
+**El plazo no depende de que alguien corra un comando.** `VencerReservasMiddleware`
+barre las vencidas aprovechando el trafico normal, como maximo una vez por minuto
+(`cache.add()` decide quien barre, que es atomico; un `if not existe` no lo es).
+`vencer_reservas` sigue existiendo para cuando la tienda esta quieta. Y aunque
+nadie barra, `disponible` ya descuenta lo vencido al leer: el barrido ordena el
+papeleo, no habilita la venta.
 
 **Pantallas propias, fuera del admin:**
 
-- `/pago` — el cliente elige cuenta, ve el QR y sube su comprobante
+- `/pago` — el cliente elige cuenta, ve el QR, sube su comprobante y tiene el
+  WhatsApp del asesor a mano
 - `/validar` — bandeja de comprobantes hecha para el celular, ordenada por
   antiguedad; ahi llega el enlace del correo de aviso
 - `/transportes` — que ciudad quedo sin viaje programado
+
+**El aviso flotante es el camino de vuelta a `/pago`.** No hay ninguna URL que
+lleve ahi: se encuentra por la sesion. Quien se iba a mirar otro producto perdia
+el rastro y se le vencia la reserva sin enterarse. El aviso lo sigue en toda la
+tienda con su contador, y desaparece solo en `/pago` (ahi ya hay uno) y cuando el
+pedido deja de estar esperando pago.
+
+**Seis correos al cliente**, todos en `avisos.py` y todos con `on_commit` y
+`fail_silently`: comprobante recibido, pago confirmado, listo para recojo,
+enviado, entregado, comprobante rechazado. Un correo caido no puede voltear la
+transaccion que ya se confirmo -- el pedido vale mas que el aviso.
 
 **No hay contra-entrega** (decidido el 2026-08-27). Pagar en billetes al
 motorizado genera efectivo bajo custodia, o sea una caja con otro nombre, y eso
 llega bien hecho en la fase 11.
 
-### Lo unico abierto de la fase 7
+### Lo que quedo abierto
 
-Si el horario del punto de recojo se guarda estructurado (hora de apertura y
-cierre) para poder decir "retiralo hoy hasta las 10pm". Por ahora se decidio que
-no hace falta: dice "Retiralo hoy" con el horario a la vista al lado.
+**Si conviene reservar.** La pregunta es de fondo y esta sin decidir: la reserva
+existe para que dos clientes no se lleven la misma unidad en el mismo segundo,
+pero eso ya lo garantiza el bloqueo de filas al confirmar el pago. Lo que agrega
+la reserva es un plazo, y un plazo trae de arrastre todo lo demas -- el
+vencimiento, el barrido, el contador, el aviso, el reemplazo, el estado
+EXPIRADO. Sacarla simplifica mucho y cambia la promesa: el primero que sube el
+comprobante se lo lleva. La rama `sin-reservas` esta creada para probarlo, y el
+tag `antes-de-quitar-reservas` marca el punto de vuelta.
+
+**El cliente no puede volver a agregar lo que el mismo reservo.** Su reserva le
+come su propio `disponible`, asi que el catalogo le dice agotado a un producto
+que tiene guardado. Si igual arma otro pedido, la reserva vieja se suelta y el
+producto NO queda en el nuevo. Esta verificado y hace dano; la solucion depende
+de la decision de arriba.
+
+**El stock vuelve a la ciudad equivocada al cancelar.** Si el pedido reservo en
+Huancavelica y se cancela, el `liberar()` no siempre acierta la ubicacion.
+Pendiente de arreglar.
+
+**Buscar un pedido por su codigo.** El aviso flotante vive en la sesion, asi que
+no cubre el cambio de dispositivo. Hace falta una pantalla que reciba
+`R-XXXXXXXX` o `PYYYYMMDD-XXXXX` y muestre el estado, y despues un "Mis pedidos"
+completo.
+
+**El horario del punto de recojo, estructurado** (hora de apertura y cierre) para
+poder decir "retiralo hoy hasta las 10pm". Se decidio que por ahora no hace
+falta: dice "Retiralo hoy" con el horario a la vista al lado.
 
 ### El estado del repositorio
 
-Rama `main`, ultimo commit `e5711da fase 7 proceso`: 53 archivos con todo lo de
-las fases 6 y 7, incluidas las migraciones 0014 a 0028. El codigo esta commiteado;
-lo unico modificado es este archivo. Conviene arrancar mirando `git status`: esta
-linea envejece sola.
+Rama `fase-7-reserva-y-pedido-formal`, ultimo commit
+`49a155e Un pedido nuevo suelta la reserva anterior de la misma sesion`. Trae la
+separacion entre reserva y pedido formal, los correos al cliente y el aviso
+flotante (migraciones 0029 a 0033). Todo esta empujado a GitHub. `main` sigue en
+`e5711da` a la espera del merge.
+
+Antes de tocar el modelo de reservas se dejaron dos puntos de vuelta: el tag
+`antes-de-quitar-reservas`, la rama `sin-reservas` para el experimento, y un
+volcado de la base en `~/Documents/respaldos-goatx/`.
+
+Conviene arrancar mirando `git status`: esta linea envejece sola.
 
 ## Bloqueantes de produccion
 
